@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+{% block title %}Portfolio — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 class="page-title">Paper Portfolio</h1>
+  <span class="page-subtitle">Track your paper trades and P&L</span>
+</div>
+
+<!-- Portfolio Summary Cards -->
+<div class="stats-row" id="portfolio-stats">
+  <div class="stat-card">
+    <div class="stat-label">Total Value</div>
+    <div class="stat-value" id="total-value">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Total Cost</div>
+    <div class="stat-value dim" id="total-cost">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Unrealized P&L</div>
+    <div class="stat-value" id="total-pnl">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Return</div>
+    <div class="stat-value" id="total-return">—</div>
+  </div>
+</div>
+
+<!-- Charts Row -->
+<div class="charts-row" id="charts-row" style="display:none">
+  <div class="chart-card">
+    <h3 class="chart-title">Allocation</h3>
+    <div class="chart-container-sm">
+      <canvas id="allocationChart"></canvas>
+    </div>
+  </div>
+  <div class="chart-card chart-card-wide">
+    <h3 class="chart-title">P&L by Position</h3>
+    <div class="chart-container-sm">
+      <canvas id="pnlChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Positions Table -->
+<section class="section">
+  <h2 class="section-title">Positions</h2>
+  <div id="positions-container">
+    <div class="loading-state">Loading positions...</div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Trade History</h2>
+    <span class="section-hint">Log trades with: <code>nantucket trade buy AAPL 10 --price 185</code></span>
+  </div>
+  <div id="history-hint" class="empty-state" style="display:none">
+    <p>No trades recorded yet.</p>
+    <p class="empty-hint">Try: <code>nantucket trade buy AAPL 10 --price 185.50</code></p>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let allocationChart = null;
+let pnlChart = null;
+
+async function loadPortfolio() {
+  try {
+    const data = await fetchJSON('/api/portfolio');
+
+    // Stats
+    document.getElementById('total-value').textContent =
+      data.total_value > 0 ? formatCurrency(data.total_value) : '$0.00';
+    document.getElementById('total-cost').textContent =
+      data.total_cost > 0 ? formatCurrency(data.total_cost) : '$0.00';
+    document.getElementById('total-pnl').innerHTML =
+      data.total_value > 0 ? coloredChange(data.total_pnl, true) : '$0.00';
+    document.getElementById('total-return').innerHTML =
+      data.total_value > 0 ? coloredChangePct(data.total_pnl_pct) : '0.00%';
+
+    if (!data.positions.length) {
+      document.getElementById('positions-container').innerHTML = `
+        <div class="empty-state">
+          <p>No open positions.</p>
+          <p class="empty-hint">Try: <code>nantucket trade buy AAPL 10 --price 185.50</code></p>
+        </div>`;
+      document.getElementById('history-hint').style.display = '';
+      return;
+    }
+
+    renderPositionsTable(data.positions);
+    renderCharts(data.positions);
+  } catch(e) {
+    document.getElementById('positions-container').innerHTML =
+      '<div class="empty-state">Error loading portfolio: ' + e.message + '</div>';
+  }
+}
+
+function renderPositionsTable(positions) {
+  const rows = positions.map(p => `
+    <tr>
+      <td><a href="/stock/${p.ticker}" class="ticker-link">${p.ticker}</a></td>
+      <td class="num">${p.quantity % 1 === 0 ? p.quantity : p.quantity.toFixed(4)}</td>
+      <td class="num dim">${formatCurrency(p.avg_cost)}</td>
+      <td class="num">${formatCurrency(p.current_price)}</td>
+      <td class="num">${formatCurrency(p.current_value)}</td>
+      <td class="num">${coloredChange(p.unrealized_pnl, true)}</td>
+      <td class="num">${coloredChangePct(p.unrealized_pnl_pct)}</td>
+      <td class="num dim">${p.allocation_pct.toFixed(1)}%</td>
+    </tr>`).join('');
+
+  document.getElementById('positions-container').innerHTML = `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Ticker</th><th>Qty</th><th>Avg Cost</th><th>Current</th>
+          <th>Value</th><th>P&L $</th><th>P&L %</th><th>Alloc</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderCharts(positions) {
+  document.getElementById('charts-row').style.display = '';
+
+  const COLORS = [
+    '#3b82f6','#8b5cf6','#06b6d4','#10b981','#f59e0b',
+    '#ef4444','#f97316','#84cc16','#ec4899','#6366f1',
+  ];
+
+  // Allocation Pie
+  const allocCtx = document.getElementById('allocationChart').getContext('2d');
+  if (allocationChart) allocationChart.destroy();
+  allocationChart = new Chart(allocCtx, {
+    type: 'doughnut',
+    data: {
+      labels: positions.map(p => p.ticker),
+      datasets: [{
+        data: positions.map(p => p.allocation_pct.toFixed(1)),
+        backgroundColor: COLORS.slice(0, positions.length),
+        borderColor: '#1e293b',
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: '#94a3b8', font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${ctx.label}: ${ctx.parsed}%`
+          }
+        }
+      }
+    }
+  });
+
+  // P&L Bar
+  const pnlCtx = document.getElementById('pnlChart').getContext('2d');
+  if (pnlChart) pnlChart.destroy();
+  pnlChart = new Chart(pnlCtx, {
+    type: 'bar',
+    data: {
+      labels: positions.map(p => p.ticker),
+      datasets: [{
+        label: 'Unrealized P&L ($)',
+        data: positions.map(p => p.unrealized_pnl.toFixed(2)),
+        backgroundColor: positions.map(p =>
+          p.unrealized_pnl >= 0 ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.7)'
+        ),
+        borderColor: positions.map(p =>
+          p.unrealized_pnl >= 0 ? '#22c55e' : '#ef4444'
+        ),
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` $${parseFloat(ctx.parsed.y).toFixed(2)}`
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.1)' } },
+        y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.1)' } },
+      }
+    }
+  });
+}
+
+loadPortfolio();
+</script>
+{% endblock %}

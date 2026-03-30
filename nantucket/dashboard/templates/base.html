@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}NANTUCKET{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <nav class="navbar">
+    <a href="/" class="nav-brand">⚓ NANTUCKET</a>
+    <div class="nav-links">
+      <a href="/"          class="nav-link {% if request.url.path == '/' %}active{% endif %}">Overview</a>
+      <a href="/screener"  class="nav-link {% if '/screener' in request.url.path %}active{% endif %}">Screener</a>
+      <a href="/portfolio" class="nav-link {% if '/portfolio' in request.url.path %}active{% endif %}">Portfolio</a>
+    </div>
+  </nav>
+
+  <main class="main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

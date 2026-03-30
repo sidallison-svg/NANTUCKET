@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% block title %}{{ ticker }} — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title" id="stock-name">{{ ticker }}</h1>
+    <span class="page-subtitle" id="stock-meta">Loading...</span>
+  </div>
+  <div class="stock-price-block">
+    <div class="stock-price" id="stock-price">—</div>
+    <div class="stock-change" id="stock-change">—</div>
+  </div>
+</div>
+
+<!-- Key Stats Row -->
+<div class="stats-row" id="key-stats" style="display:none">
+  <div class="stat-card"><div class="stat-label">P/E (TTM)</div><div class="stat-value" id="stat-pe">—</div></div>
+  <div class="stat-card"><div class="stat-label">P/B</div><div class="stat-value" id="stat-pb">—</div></div>
+  <div class="stat-card"><div class="stat-label">EPS</div><div class="stat-value" id="stat-eps">—</div></div>
+  <div class="stat-card"><div class="stat-label">Div Yield</div><div class="stat-value" id="stat-div">—</div></div>
+  <div class="stat-card"><div class="stat-label">Market Cap</div><div class="stat-value" id="stat-mktcap">—</div></div>
+  <div class="stat-card"><div class="stat-label">Vol / Avg</div><div class="stat-value" id="stat-vol">—</div></div>
+</div>
+
+<!-- 52-Week Range Bar -->
+<section class="section">
+  <div class="range-bar-container" id="range-bar-container" style="display:none">
+    <div class="range-labels">
+      <span id="range-low">52W Low</span>
+      <span class="dim">52-Week Range</span>
+      <span id="range-high">52W High</span>
+    </div>
+    <div class="range-bar">
+      <div class="range-fill" id="range-fill"></div>
+      <div class="range-marker" id="range-marker"></div>
+    </div>
+  </div>
+</section>
+
+<!-- Price Chart -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Price History</h2>
+    <div class="period-buttons">
+      <button class="period-btn active" onclick="loadChart('1mo')">1M</button>
+      <button class="period-btn" onclick="loadChart('3mo')">3M</button>
+      <button class="period-btn" onclick="loadChart('6mo')">6M</button>
+      <button class="period-btn" onclick="loadChart('1y')">1Y</button>
+      <button class="period-btn" onclick="loadChart('2y')">2Y</button>
+    </div>
+  </div>
+  <div class="chart-container">
+    <canvas id="priceChart"></canvas>
+  </div>
+</section>
+
+<!-- AI Analysis -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">AI Analysis</h2>
+    <div class="ai-buttons">
+      <button class="ai-btn" onclick="loadExplain()" id="explain-btn">
+        📖 Explain
+      </button>
+      <button class="ai-btn" onclick="loadBullBear()" id="bullbear-btn">
+        🐂🐻 Bull/Bear
+      </button>
+    </div>
+  </div>
+  <div id="ai-result" class="ai-result">
+    <div class="empty-state">Click <strong>Explain</strong> or <strong>Bull/Bear</strong> to generate AI analysis.<br>
+    <span class="dim small">Requires ANTHROPIC_API_KEY</span></div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TICKER = '{{ ticker }}';
+let priceChart = null;
+let currentQuote = null;
+
+async function loadStockData() {
+  try {
+    const data = await fetchJSON(`/api/stock/${TICKER}`);
+    currentQuote = data.quote;
+    renderQuote(data.quote);
+    if (data.chart && data.chart.dates) {
+      renderPriceChart(data.chart);
+    }
+  } catch(e) {
+    document.getElementById('stock-meta').textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderQuote(q) {
+  document.getElementById('stock-name').textContent = q.name || q.ticker;
+  document.getElementById('stock-meta').textContent =
+    [q.sector, q.industry].filter(Boolean).join(' · ') || q.asset_type;
+
+  document.getElementById('stock-price').textContent = formatCurrency(q.price);
+  document.getElementById('stock-change').innerHTML =
+    coloredChange(q.change, true) + ' (' + coloredChangePct(q.change_pct) + ')  ' +
+    '<span class="dim small">1W: ' + (q.change_1w >= 0 ? '+' : '') + q.change_1w.toFixed(2) + '%</span>';
+
+  document.getElementById('key-stats').style.display = '';
+  document.getElementById('stat-pe').textContent = q.pe_ratio ? q.pe_ratio + 'x' : '—';
+  document.getElementById('stat-pb').textContent = q.pb_ratio ? q.pb_ratio + 'x' : '—';
+  document.getElementById('stat-eps').textContent = q.eps ? '$' + q.eps : '—';
+  document.getElementById('stat-div').textContent = q.dividend_yield ? q.dividend_yield + '%' : '—';
+  document.getElementById('stat-mktcap').textContent = formatMarketCap(q.market_cap);
+  document.getElementById('stat-vol').textContent =
+    q.volume_ratio ? q.volume_ratio.toFixed(1) + 'x' : '—';
+
+  // 52-week range
+  if (q.week_52_low && q.week_52_high) {
+    document.getElementById('range-bar-container').style.display = '';
+    document.getElementById('range-low').textContent = '$' + q.week_52_low.toFixed(2);
+    document.getElementById('range-high').textContent = '$' + q.week_52_high.toFixed(2);
+    const pct = ((q.price - q.week_52_low) / (q.week_52_high - q.week_52_low) * 100).toFixed(1);
+    document.getElementById('range-fill').style.width = pct + '%';
+    document.getElementById('range-marker').style.left = pct + '%';
+  }
+}
+
+function renderPriceChart(chart) {
+  const ctx = document.getElementById('priceChart').getContext('2d');
+  if (priceChart) priceChart.destroy();
+
+  // Color gradient: green if last > first, red if down
+  const isUp = chart.closes[chart.closes.length - 1] >= chart.closes[0];
+  const lineColor = isUp ? '#22c55e' : '#ef4444';
+  const gradientColor = isUp ? 'rgba(34,197,94,' : 'rgba(239,68,68,';
+
+  const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+  gradient.addColorStop(0, gradientColor + '0.3)');
+  gradient.addColorStop(1, gradientColor + '0.02)');
+
+  priceChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: chart.dates,
+      datasets: [{
+        label: TICKER,
+        data: chart.closes,
+        borderColor: lineColor,
+        backgroundColor: gradient,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        fill: true,
+        tension: 0.1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` $${ctx.parsed.y.toFixed(2)}`
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            color: '#94a3b8',
+            maxTicksLimit: 8,
+            maxRotation: 0,
+          },
+          grid: { color: 'rgba(148,163,184,0.08)' }
+        },
+        y: {
+          ticks: {
+            color: '#94a3b8',
+            callback: v => '$' + v.toFixed(0)
+          },
+          grid: { color: 'rgba(148,163,184,0.08)' }
+        }
+      }
+    }
+  });
+}
+
+async function loadChart(period) {
+  document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+
+  try {
+    const data = await fetchJSON(`/api/stock/${TICKER}?period=${period}`);
+    if (data.chart && data.chart.dates) {
+      renderPriceChart(data.chart);
+    }
+  } catch(e) { console.error(e); }
+}
+
+async function loadExplain() {
+  const btn = document.getElementById('explain-btn');
+  const result = document.getElementById('ai-result');
+  btn.disabled = true;
+  btn.textContent = '⏳ Analyzing...';
+  result.innerHTML = '<div class="loading-state">Claude is analyzing ' + TICKER + '...<br><span class="dim small">Searching for recent news...</span></div>';
+
+  try {
+    const data = await fetchJSON(`/api/stock/${TICKER}/explain`);
+    result.innerHTML = '<div class="ai-text">' + markdownToHtml(data.explanation) + '</div>';
+  } catch(e) {
+    result.innerHTML = '<div class="error-state">Error: ' + e.message + '<br><span class="dim small">Make sure ANTHROPIC_API_KEY is set.</span></div>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📖 Explain';
+  }
+}
+
+async function loadBullBear() {
+  const btn = document.getElementById('bullbear-btn');
+  const result = document.getElementById('ai-result');
+  btn.disabled = true;
+  btn.textContent = '⏳ Analyzing...';
+  result.innerHTML = '<div class="loading-state">Building bull/bear case for ' + TICKER + '...</div>';
+
+  try {
+    const data = await fetchJSON(`/api/stock/${TICKER}/bull-bear`);
+    result.innerHTML = '<div class="ai-text">' + markdownToHtml(data.raw) + '</div>';
+  } catch(e) {
+    result.innerHTML = '<div class="error-state">Error: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🐂🐻 Bull/Bear';
+  }
+}
+
+// Very simple markdown → HTML (headers, bold, paragraphs)
+function markdownToHtml(text) {
+  return text
+    .replace(/## (.+)/g, '<h3 class="ai-heading">$1</h3>')
+    .replace(/### (.+)/g, '<h4 class="ai-subheading">$1</h4>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>')
+    .replace(/^/, '<p>')
+    .replace(/$/, '</p>');
+}
+
+loadStockData();
+</script>
+{% endblock %}

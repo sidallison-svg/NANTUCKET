@@ -1,0 +1,111 @@
+{
+  "_comment": "Built-in screening presets. Each preset defines filters and sort criteria.",
+  "_filter_keys": {
+    "pe_max": "Maximum trailing P/E ratio",
+    "pe_min": "Minimum trailing P/E ratio",
+    "pb_max": "Maximum price-to-book ratio",
+    "pb_min": "Minimum price-to-book ratio",
+    "eps_min": "Minimum trailing EPS (earnings per share)",
+    "market_cap_min": "Minimum market cap in dollars",
+    "market_cap_max": "Maximum market cap in dollars",
+    "volume_min": "Minimum today's volume",
+    "volume_ratio_min": "Minimum volume / avg_volume (e.g. 1.5 = 50% above average)",
+    "div_yield_min": "Minimum dividend yield in percent (e.g. 3 = 3%)",
+    "change_pct_min": "Minimum daily % change",
+    "change_pct_max": "Maximum daily % change",
+    "change_1w_min": "Minimum 1-week % change",
+    "above_50ma": "Must be trading above the 50-day moving average (true/false)",
+    "above_200ma": "Must be trading above the 200-day moving average (true/false)",
+    "near_52w_low": "Within N% of the 52-week low (number, e.g. 10 = within 10%)",
+    "sector": "Filter by sector name (e.g. 'Technology', 'Healthcare')",
+    "revenue_growth_min": "Minimum YoY revenue growth as decimal (e.g. 0.20 = 20%)",
+    "earnings_growth_min": "Minimum YoY earnings growth as decimal"
+  },
+
+  "value": {
+    "description": "Classic value investing screen — low P/E, low P/B, profitable companies trading at a discount to fundamentals.",
+    "learning_note": "Value investors (like Warren Buffett) look for companies that are 'cheap' relative to their earnings and assets. P/E < 15 means you're paying less than $15 for every $1 of earnings.",
+    "filters": {
+      "pe_max": 15,
+      "pb_max": 1.5,
+      "eps_min": 0.01,
+      "market_cap_min": 1000000000
+    },
+    "sort_by": "pe_ratio",
+    "sort_order": "asc",
+    "asset_types": ["stock"]
+  },
+
+  "momentum": {
+    "description": "Stocks with strong price momentum — above their 50-day MA, high relative volume, and recent outperformance.",
+    "learning_note": "Momentum investing is based on the idea that stocks trending up tend to keep trending up (at least short-term). High relative volume means big money is moving in.",
+    "filters": {
+      "above_50ma": true,
+      "volume_ratio_min": 1.5,
+      "change_1w_min": 2.0,
+      "market_cap_min": 1000000000
+    },
+    "sort_by": "change_1w",
+    "sort_order": "desc",
+    "asset_types": ["stock", "etf"]
+  },
+
+  "dividend": {
+    "description": "Income-focused screen — stocks with dividend yields above 3% and solid earnings to support the payout.",
+    "learning_note": "Dividend yield = annual dividend / stock price. A 3% yield on a $100 stock means $3/year per share. Look for sustainable payouts (not companies paying more than they earn).",
+    "filters": {
+      "div_yield_min": 3.0,
+      "eps_min": 0.01,
+      "market_cap_min": 5000000000
+    },
+    "sort_by": "dividend_yield",
+    "sort_order": "desc",
+    "asset_types": ["stock"]
+  },
+
+  "growth": {
+    "description": "High-growth companies with accelerating revenue and earnings — often higher P/E but worth it if growth is real.",
+    "learning_note": "Growth investors pay a premium today for future earnings. Revenue growth > 20% YoY suggests the company is taking market share. Watch out for 'growth traps' — companies that grow revenue but never turn profitable.",
+    "filters": {
+      "revenue_growth_min": 0.20,
+      "market_cap_min": 1000000000
+    },
+    "sort_by": "revenue_growth",
+    "sort_order": "desc",
+    "asset_types": ["stock"]
+  },
+
+  "oversold": {
+    "description": "Beaten-down stocks near their 52-week lows — potential bounce candidates (but could also keep falling).",
+    "learning_note": "Contrarian investing: buying what everyone else is selling. Near 52-week lows can mean opportunity OR a value trap. Always ask WHY a stock fell before buying the dip.",
+    "filters": {
+      "near_52w_low": 10,
+      "market_cap_min": 1000000000
+    },
+    "sort_by": "price_vs_52w_low_pct",
+    "sort_order": "asc",
+    "asset_types": ["stock"]
+  },
+
+  "large_cap": {
+    "description": "The biggest, most stable companies (market cap > $100B). Less volatility, battle-tested businesses.",
+    "learning_note": "Large caps are the 'blue chips' — companies like Apple, Microsoft, Johnson & Johnson. Lower risk than small caps but also lower growth potential.",
+    "filters": {
+      "market_cap_min": 100000000000
+    },
+    "sort_by": "market_cap",
+    "sort_order": "desc",
+    "asset_types": ["stock", "etf"]
+  },
+
+  "volume_spike": {
+    "description": "Unusual volume today — stocks with 2x+ average daily volume. Something is happening.",
+    "learning_note": "Volume spikes often precede or accompany big price moves. Could be earnings, news, activist investor, acquisition rumor — always dig into WHY volume is elevated.",
+    "filters": {
+      "volume_ratio_min": 2.0
+    },
+    "sort_by": "volume_ratio",
+    "sort_order": "desc",
+    "asset_types": ["stock", "etf"]
+  }
+}

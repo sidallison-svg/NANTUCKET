@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block title %}Screener — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 class="page-title">Stock Screener</h1>
+  <span class="page-subtitle">Filter stocks by fundamentals, technicals, and momentum</span>
+</div>
+
+<div class="screener-layout">
+  <!-- Filters Panel -->
+  <aside class="filter-panel">
+    <h3 class="filter-heading">Presets</h3>
+    <div class="preset-grid">
+      {% for name in preset_names %}
+      <button class="preset-btn" data-preset="{{ name }}" onclick="applyPreset('{{ name }}')">
+        {{ name }}
+      </button>
+      {% endfor %}
+      <button class="preset-btn preset-clear" onclick="clearFilters()">Clear</button>
+    </div>
+
+    <h3 class="filter-heading">Valuation</h3>
+    <div class="filter-group">
+      <label>Max P/E Ratio</label>
+      <input type="number" id="pe_max" placeholder="e.g. 15" step="0.1" />
+    </div>
+    <div class="filter-group">
+      <label>Max P/B Ratio</label>
+      <input type="number" id="pb_max" placeholder="e.g. 1.5" step="0.1" />
+    </div>
+    <div class="filter-group">
+      <label>Min EPS ($)</label>
+      <input type="number" id="eps_min" placeholder="e.g. 0.01" step="0.01" />
+    </div>
+
+    <h3 class="filter-heading">Income</h3>
+    <div class="filter-group">
+      <label>Min Dividend Yield (%)</label>
+      <input type="number" id="div_yield_min" placeholder="e.g. 3" step="0.1" />
+    </div>
+
+    <h3 class="filter-heading">Momentum</h3>
+    <div class="filter-group">
+      <label>Min Volume Ratio (vs avg)</label>
+      <input type="number" id="volume_ratio_min" placeholder="e.g. 1.5" step="0.1" />
+    </div>
+    <div class="filter-group">
+      <label>Min 1-Week Change (%)</label>
+      <input type="number" id="change_1w_min" placeholder="e.g. 2" step="0.5" />
+    </div>
+
+    <h3 class="filter-heading">Technical</h3>
+    <div class="filter-group checkbox-group">
+      <label>
+        <input type="checkbox" id="above_50ma" />
+        Above 50-Day MA
+      </label>
+    </div>
+    <div class="filter-group">
+      <label>Near 52-Week Low (within %)</label>
+      <input type="number" id="near_52w_low" placeholder="e.g. 10" step="1" />
+    </div>
+
+    <h3 class="filter-heading">Size</h3>
+    <div class="filter-group">
+      <label>Min Market Cap ($B)</label>
+      <input type="number" id="market_cap_min_b" placeholder="e.g. 1" step="0.5" />
+    </div>
+
+    <h3 class="filter-heading">Sector</h3>
+    <div class="filter-group">
+      <select id="sector">
+        <option value="">Any Sector</option>
+        <option>Technology</option>
+        <option>Healthcare</option>
+        <option>Financials</option>
+        <option>Consumer Discretionary</option>
+        <option>Consumer Staples</option>
+        <option>Energy</option>
+        <option>Industrials</option>
+        <option>Materials</option>
+        <option>Real Estate</option>
+        <option>Utilities</option>
+        <option>Communication Services</option>
+      </select>
+    </div>
+
+    <h3 class="filter-heading">Universe</h3>
+    <div class="filter-group">
+      <select id="universe">
+        <option value="top100">Top 100 (fast ~30s)</option>
+        <option value="sp500">S&P 500 (thorough ~3-5min)</option>
+      </select>
+    </div>
+
+    <button class="run-btn" onclick="runScreen()">
+      ▶ Run Screen
+    </button>
+  </aside>
+
+  <!-- Results Panel -->
+  <div class="results-panel">
+    <div id="screen-status" class="screen-status" style="display:none"></div>
+    <div id="learning-note" class="learning-note" style="display:none"></div>
+    <div id="screen-results">
+      <div class="empty-state">
+        Select a preset or set filters, then click <strong>Run Screen</strong>.
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const PRESET_DATA = {};
+
+  async function loadPresets() {
+    const data = await fetchJSON('/api/presets');
+    Object.assign(PRESET_DATA, data);
+  }
+
+  async function applyPreset(name) {
+    // Highlight active preset
+    document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector(`[data-preset="${name}"]`)?.classList.add('active');
+
+    // Show learning note
+    const note = PRESET_DATA[name]?.learning_note;
+    const noteEl = document.getElementById('learning-note');
+    if (note) {
+      noteEl.textContent = '💡 ' + note;
+      noteEl.style.display = '';
+    } else {
+      noteEl.style.display = 'none';
+    }
+
+    // Auto-run the screen
+    await runScreen(name);
+  }
+
+  function clearFilters() {
+    ['pe_max','pb_max','eps_min','div_yield_min','volume_ratio_min',
+     'change_1w_min','near_52w_low','market_cap_min_b'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+    document.getElementById('above_50ma').checked = false;
+    document.getElementById('sector').value = '';
+    document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('learning-note').style.display = 'none';
+    document.getElementById('screen-results').innerHTML =
+      '<div class="empty-state">Filters cleared. Set new filters and run screen.</div>';
+    document.getElementById('screen-status').style.display = 'none';
+  }
+
+  async function runScreen(preset = null) {
+    const statusEl = document.getElementById('screen-status');
+    const resultsEl = document.getElementById('screen-results');
+
+    statusEl.textContent = '⏳ Fetching market data... This may take 30-60 seconds.';
+    statusEl.style.display = '';
+    resultsEl.innerHTML = '<div class="loading-state">Screening stocks...</div>';
+
+    const params = new URLSearchParams();
+    if (preset) params.set('preset', preset);
+    const universe = document.getElementById('universe').value;
+    params.set('universe', universe);
+    params.set('limit', '15');
+
+    const addParam = (id, key, transform) => {
+      const val = document.getElementById(id).value;
+      if (val) params.set(key, transform ? transform(val) : val);
+    };
+
+    addParam('pe_max', 'pe_max');
+    addParam('pb_max', 'pb_max');
+    addParam('eps_min', 'eps_min');
+    addParam('div_yield_min', 'div_yield_min');
+    addParam('volume_ratio_min', 'volume_ratio_min');
+    addParam('change_1w_min', 'change_1w_min');
+    addParam('near_52w_low', 'near_52w_low');
+    addParam('market_cap_min_b', 'market_cap_min', v => parseFloat(v) * 1e9);
+    addParam('sector', 'sector');
+
+    if (document.getElementById('above_50ma').checked) {
+      params.set('above_50ma', 'true');
+    }
+
+    try {
+      const data = await fetchJSON('/api/screen?' + params.toString());
+      statusEl.textContent =
+        `✓ Found ${data.count} matches from ${data.universe_size} stocks (${data.errors} errors)`;
+      renderScreenResults(data.results);
+    } catch(e) {
+      statusEl.textContent = '✗ Error running screen: ' + e.message;
+      resultsEl.innerHTML = '';
+    }
+  }
+
+  function renderScreenResults(results) {
+    const el = document.getElementById('screen-results');
+    if (!results.length) {
+      el.innerHTML = '<div class="empty-state">No stocks matched your filters. Try relaxing the criteria.</div>';
+      return;
+    }
+
+    const rows = results.map((q, i) => `
+      <tr>
+        <td class="dim">${i + 1}</td>
+        <td><a href="/stock/${q.ticker}" class="ticker-link">${q.ticker}</a></td>
+        <td class="dim small">${truncate(q.name, 22)}</td>
+        <td class="num">${formatCurrency(q.price)}</td>
+        <td class="num">${coloredChangePct(q.change_pct)}</td>
+        <td class="num">${coloredChangePct(q.change_1w)}</td>
+        <td class="num">${q.pe_ratio ? q.pe_ratio + 'x' : '—'}</td>
+        <td class="num">${q.pb_ratio ? q.pb_ratio + 'x' : '—'}</td>
+        <td class="num">${q.dividend_yield ? q.dividend_yield + '%' : '—'}</td>
+        <td class="num dim">${formatMarketCap(q.market_cap)}</td>
+        <td class="dim small">${q.sector || '—'}</td>
+      </tr>`).join('');
+
+    el.innerHTML = `
+      <div class="table-wrapper">
+        <table class="data-table sortable">
+          <thead>
+            <tr>
+              <th>#</th><th>Ticker</th><th>Name</th><th>Price</th>
+              <th>Day %</th><th>Week %</th><th>P/E</th><th>P/B</th>
+              <th>Div Yield</th><th>Mkt Cap</th><th>Sector</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  loadPresets();
+</script>
+{% endblock %}

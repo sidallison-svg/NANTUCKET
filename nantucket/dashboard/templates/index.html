@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}Overview — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 class="page-title">Overview</h1>
+  <span class="page-subtitle" id="last-updated">Loading...</span>
+</div>
+
+<!-- Portfolio Snapshot -->
+<section class="section">
+  <h2 class="section-title">Portfolio Snapshot</h2>
+  <div class="stats-row" id="portfolio-stats">
+    <div class="stat-card">
+      <div class="stat-label">Total Value</div>
+      <div class="stat-value" id="total-value">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="total-pnl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Return %</div>
+      <div class="stat-value" id="total-return">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Positions</div>
+      <div class="stat-value" id="position-count">—</div>
+    </div>
+  </div>
+</section>
+
+<!-- Watchlist -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Watchlist</h2>
+    <span class="section-hint">Add tickers with: <code>nantucket watch add AAPL MSFT</code></span>
+  </div>
+  <div id="watchlist-container">
+    <div class="loading-state">Loading watchlist...</div>
+  </div>
+</section>
+
+<!-- Top Movers (from watchlist) -->
+<section class="section" id="movers-section" style="display:none">
+  <h2 class="section-title">Today's Movers</h2>
+  <div class="movers-grid" id="movers-grid"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  async function loadOverview() {
+    const now = new Date();
+    document.getElementById('last-updated').textContent =
+      'Updated ' + now.toLocaleTimeString();
+
+    // Load portfolio
+    try {
+      const port = await fetchJSON('/api/portfolio');
+      document.getElementById('total-value').textContent =
+        port.total_value > 0 ? formatCurrency(port.total_value) : '—';
+      document.getElementById('total-pnl').innerHTML =
+        port.total_value > 0 ? coloredChange(port.total_pnl, true) : '—';
+      document.getElementById('total-return').innerHTML =
+        port.total_value > 0 ? coloredChangePct(port.total_pnl_pct) : '—';
+      document.getElementById('position-count').textContent =
+        port.positions.length > 0 ? port.positions.length : '0';
+    } catch(e) { console.error('Portfolio load error:', e); }
+
+    // Load watchlist
+    try {
+      const watchlist = await fetchJSON('/api/watchlist');
+      renderWatchlist(watchlist);
+      renderMovers(watchlist);
+    } catch(e) {
+      document.getElementById('watchlist-container').innerHTML =
+        '<div class="empty-state">Error loading watchlist</div>';
+    }
+  }
+
+  function renderWatchlist(quotes) {
+    const container = document.getElementById('watchlist-container');
+    if (!quotes.length) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <p>Your watchlist is empty.</p>
+          <p class="empty-hint">Add tickers with: <code>nantucket watch add AAPL MSFT BTC</code></p>
+        </div>`;
+      return;
+    }
+
+    const rows = quotes.map(q => `
+      <tr class="${q.error ? 'row-error' : ''}">
+        <td><a href="/stock/${q.ticker}" class="ticker-link">${q.ticker}</a></td>
+        <td class="dim">${truncate(q.name, 28)}</td>
+        <td class="num">${q.error ? '—' : formatCurrency(q.price)}</td>
+        <td class="num">${q.error ? '—' : coloredChangePct(q.change_pct)}</td>
+        <td class="num">${q.error ? '—' : coloredChangePct(q.change_1w)}</td>
+        <td class="num dim">${q.error ? '—' : formatVolume(q.volume)}</td>
+        <td class="num dim">${q.pe_ratio ? q.pe_ratio + 'x' : '—'}</td>
+        <td><span class="badge badge-${q.asset_type}">${q.asset_type}</span></td>
+      </tr>`).join('');
+
+    container.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Ticker</th><th>Name</th><th>Price</th>
+            <th>Day %</th><th>Week %</th><th>Volume</th>
+            <th>P/E</th><th>Type</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function renderMovers(quotes) {
+    const valid = quotes.filter(q => !q.error && q.change_pct !== 0);
+    if (!valid.length) return;
+
+    const sorted = [...valid].sort((a, b) => Math.abs(b.change_pct) - Math.abs(a.change_pct));
+    const top = sorted.slice(0, 6);
+
+    document.getElementById('movers-section').style.display = '';
+    document.getElementById('movers-grid').innerHTML = top.map(q => `
+      <a href="/stock/${q.ticker}" class="mover-card ${q.change_pct >= 0 ? 'up' : 'down'}">
+        <div class="mover-ticker">${q.ticker}</div>
+        <div class="mover-price">${formatCurrency(q.price)}</div>
+        <div class="mover-change">${coloredChangePct(q.change_pct)}</div>
+      </a>`).join('');
+  }
+
+  loadOverview();
+  setInterval(loadOverview, 60000); // Refresh every minute
+</script>
+{% endblock %}
