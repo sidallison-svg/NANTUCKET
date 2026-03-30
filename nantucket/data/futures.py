@@ -86,7 +86,8 @@ def get_futures_quote(ticker: str) -> StockQuote:
     Fetch a futures/commodity quote.
 
     Returns a StockQuote (same dataclass as stocks) with asset_type='future'.
-    This lets the rest of the app treat futures uniformly with stocks/ETFs.
+    Note: Alpha Vantage does not support futures symbols — this returns a
+    placeholder. Futures support will be added in a future update.
     """
     resolved = resolve_futures_ticker(ticker)
     meta = FUTURES_UNIVERSE.get(resolved, {})
