@@ -21,10 +21,11 @@ from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from nantucket.db.database import init_db
-from nantucket.watchlist import get_watchlist_quotes, get_watchlist
-from nantucket.portfolio import get_portfolio_summary, get_trade_history
+from nantucket.watchlist import get_watchlist_quotes, get_watchlist, add_ticker, remove_ticker
+from nantucket.portfolio import get_portfolio_summary, get_trade_history, record_buy, record_sell
 from nantucket.screener import run_screen, ScreenFilters, load_presets
 from nantucket.data.stocks import get_quote, get_history
 
@@ -205,6 +206,100 @@ async def api_bull_bear(ticker: str):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Watchlist write endpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
+class WatchlistAdd(BaseModel):
+    ticker: str
+    asset_type: str = "stock"
+
+@app.post("/api/watchlist/add")
+async def api_watchlist_add(body: WatchlistAdd):
+    """Add a ticker to the watchlist."""
+    ticker = body.ticker.upper().strip()
+    # Auto-detect asset type
+    asset_type = body.asset_type
+    if asset_type == "stock":
+        from nantucket.data.crypto import TICKER_TO_ID
+        from nantucket.data.futures import FUTURES_UNIVERSE, ALIASES
+        if ticker in TICKER_TO_ID:
+            asset_type = "crypto"
+        elif ticker in FUTURES_UNIVERSE or ticker in ALIASES:
+            asset_type = "future"
+
+    added = add_ticker(ticker, asset_type=asset_type)
+    return {"success": added, "ticker": ticker, "asset_type": asset_type,
+            "message": f"Added {ticker}" if added else f"{ticker} already in watchlist"}
+
+
+@app.delete("/api/watchlist/{ticker}")
+async def api_watchlist_remove(ticker: str):
+    """Remove a ticker from the watchlist."""
+    removed = remove_ticker(ticker.upper())
+    return {"success": removed, "ticker": ticker.upper(),
+            "message": f"Removed {ticker.upper()}" if removed else f"{ticker.upper()} not found"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trade write endpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TradeBody(BaseModel):
+    ticker: str
+    quantity: float
+    price: Optional[float] = None
+    asset_type: str = "stock"
+
+
+@app.post("/api/trade/buy")
+async def api_trade_buy(body: TradeBody):
+    """Log a paper buy trade."""
+    ticker = body.ticker.upper().strip()
+    price = body.price
+    if price is None:
+        q = get_quote(ticker)
+        if q.error or q.price == 0:
+            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
+        price = q.price
+    try:
+        trade_id = record_buy(ticker, body.quantity, price, body.asset_type)
+        return {"success": True, "trade_id": trade_id, "ticker": ticker,
+                "action": "buy", "quantity": body.quantity, "price": price,
+                "total": body.quantity * price}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/trade/sell")
+async def api_trade_sell(body: TradeBody):
+    """Log a paper sell trade."""
+    ticker = body.ticker.upper().strip()
+    price = body.price
+    if price is None:
+        q = get_quote(ticker)
+        if q.error or q.price == 0:
+            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
+        price = q.price
+    try:
+        trade_id = record_sell(ticker, body.quantity, price)
+        return {"success": True, "trade_id": trade_id, "ticker": ticker,
+                "action": "sell", "quantity": body.quantity, "price": price,
+                "total": body.quantity * price}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/trades")
+async def api_trades():
+    """Return recent trade history."""
+    trades = get_trade_history(limit=50)
+    return [{"id": t.id, "ticker": t.ticker, "action": t.action,
+             "quantity": t.quantity, "price": t.price,
+             "total": t.quantity * t.price, "timestamp": t.timestamp,
+             "asset_type": t.asset_type} for t in trades]
 
 
 @app.get("/api/presets")
