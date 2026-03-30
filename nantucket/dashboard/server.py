@@ -47,7 +47,7 @@ async def startup():
 @app.get("/", response_class=HTMLResponse)
 async def overview(request: Request):
     """Overview page: watchlist summary + portfolio snapshot."""
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html", {})
 
 
 @app.get("/screener", response_class=HTMLResponse)
@@ -56,23 +56,21 @@ async def screener_page(request: Request):
     presets = load_presets()
     preset_names = list(presets.keys())
     return templates.TemplateResponse(
-        "screener.html",
-        {"request": request, "preset_names": preset_names},
+        request, "screener.html", {"preset_names": preset_names},
     )
 
 
 @app.get("/portfolio", response_class=HTMLResponse)
 async def portfolio_page(request: Request):
     """Portfolio positions and P&L chart."""
-    return templates.TemplateResponse("portfolio.html", {"request": request})
+    return templates.TemplateResponse(request, "portfolio.html", {})
 
 
 @app.get("/stock/{ticker}", response_class=HTMLResponse)
 async def stock_detail(request: Request, ticker: str):
     """Individual stock detail page."""
     return templates.TemplateResponse(
-        "stock.html",
-        {"request": request, "ticker": ticker.upper()},
+        request, "stock.html", {"ticker": ticker.upper()},
     )
 
 
