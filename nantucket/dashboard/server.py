@@ -286,11 +286,8 @@ async def api_trade_buy(body: TradeBody):
     """Log a paper buy trade."""
     ticker = body.ticker.upper().strip()
     price = body.price
-    if price is None:
-        q = get_quote(ticker)
-        if q.error or q.price == 0:
-            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
-        price = q.price
+    if not price or price <= 0:
+        raise HTTPException(status_code=400, detail="Price is required. Enter the price per share.")
     try:
         trade_id = record_buy(ticker, body.quantity, price, body.asset_type)
         return {"success": True, "trade_id": trade_id, "ticker": ticker,
@@ -305,11 +302,8 @@ async def api_trade_sell(body: TradeBody):
     """Log a paper sell trade."""
     ticker = body.ticker.upper().strip()
     price = body.price
-    if price is None:
-        q = get_quote(ticker)
-        if q.error or q.price == 0:
-            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
-        price = q.price
+    if not price or price <= 0:
+        raise HTTPException(status_code=400, detail="Price is required. Enter the price per share.")
     try:
         trade_id = record_sell(ticker, body.quantity, price)
         return {"success": True, "trade_id": trade_id, "ticker": ticker,
