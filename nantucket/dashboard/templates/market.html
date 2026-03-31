@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+{% block title %}Market — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 class="page-title">Market Overview</h1>
+  <span class="page-subtitle dim" id="market-updated">Loading...</span>
+</div>
+
+<!-- Yield Curve -->
+<section class="section">
+  <h2 class="section-title">US Treasury Yield Curve</h2>
+  <div id="yield-inversion" class="inversion-warning" style="display:none">
+    Yield curve is inverted (3mo yield > 10yr yield) — historically a recession signal.
+  </div>
+  <div class="stats-row" id="yield-stats" style="margin-bottom:12px"></div>
+  <div class="chart-container" style="height:220px">
+    <canvas id="yieldChart"></canvas>
+  </div>
+</section>
+
+<!-- Sector Heatmap -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Sector Performance (S&P 500)</h2>
+    <div class="tab-row" id="sector-tab-row">
+      <button class="tab-btn active" onclick="showSectorPeriod('1d', this)">Today</button>
+      <button class="tab-btn" onclick="showSectorPeriod('1w', this)">1 Week</button>
+      <button class="tab-btn" onclick="showSectorPeriod('1mo', this)">1 Month</button>
+    </div>
+  </div>
+  <div id="sector-heatmap" class="sector-grid">
+    <div class="loading-state">Loading sectors...</div>
+  </div>
+</section>
+
+<!-- Market Movers -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Market Movers (S&P 100)</h2>
+    <div class="tab-row" id="movers-tab-row">
+      <button class="tab-btn active" onclick="showMovers('gainers', this)">Gainers</button>
+      <button class="tab-btn" onclick="showMovers('losers', this)">Losers</button>
+      <button class="tab-btn" onclick="showMovers('active', this)">Most Active</button>
+    </div>
+  </div>
+  <div id="movers-container"><div class="loading-state">Loading movers...</div></div>
+</section>
+
+<!-- Upcoming Earnings -->
+<section class="section">
+  <h2 class="section-title">Upcoming Earnings (Watchlist)</h2>
+  <div id="earnings-container"><div class="loading-state">Loading earnings...</div></div>
+</section>
+
+<!-- Economic Calendar -->
+<section class="section">
+  <h2 class="section-title">Economic Calendar</h2>
+  <div id="econ-container"><div class="loading-state">Loading economic calendar...</div></div>
+</section>
+
+<!-- News Feed -->
+<section class="section">
+  <h2 class="section-title">Market News</h2>
+  <div id="news-container"><div class="loading-state">Loading news...</div></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let sectorData = null;
+let moversData = null;
+let yieldChart = null;
+
+async function loadMarket() {
+  document.getElementById('market-updated').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+
+  // Fire all in parallel
+  const [yieldRes, sectorsRes, moversRes, earningsRes, econRes, newsRes] = await Promise.allSettled([
+    fetchJSON('/api/yield-curve'),
+    fetchJSON('/api/sectors'),
+    fetchJSON('/api/movers?limit=10'),
+    fetchJSON('/api/earnings?days=21'),
+    fetchJSON('/api/econ-calendar'),
+    fetchJSON('/api/news?limit=20'),
+  ]);
+
+  if (yieldRes.status === 'fulfilled')   renderYieldCurve(yieldRes.value);
+  if (sectorsRes.status === 'fulfilled') { sectorData = sectorsRes.value; renderSectors('1d'); }
+  if (moversRes.status === 'fulfilled')  { moversData = moversRes.value; renderMovers('gainers'); }
+  if (earningsRes.status === 'fulfilled') renderEarnings(earningsRes.value);
+  if (econRes.status === 'fulfilled')    renderEcon(econRes.value);
+  if (newsRes.status === 'fulfilled')    renderNews(newsRes.value);
+}
+
+// ── Yield Curve ─────────────────────────────────────────────────────────────
+function renderYieldCurve(data) {
+  if (data.error && !data.points.length) {
+    document.querySelector('#yield-stats').innerHTML =
+      `<div class="error-state">${data.error}</div>`;
+    return;
+  }
+  if (data.is_inverted) {
+    document.getElementById('yield-inversion').style.display = '';
+  }
+
+  // Stat cards
+  let statsHtml = '';
+  for (const p of data.points) {
+    const chgColor = p.change_bps >= 0 ? 'text-up' : 'text-down';
+    const chgStr = (p.change_bps >= 0 ? '+' : '') + p.change_bps.toFixed(1) + ' bps';
+    statsHtml += `<div class="stat-card">
+      <div class="stat-label">${p.label}</div>
+      <div class="stat-value">${p.yield_pct.toFixed(3)}%</div>
+      <div class="stat-sub ${chgColor}">${chgStr}</div>
+    </div>`;
+  }
+  if (data.spread_10y3m !== undefined) {
+    const sp = data.spread_10y3m;
+    const spColor = sp >= 0 ? 'text-up' : 'text-down';
+    statsHtml += `<div class="stat-card">
+      <div class="stat-label">10Y–3M Spread</div>
+      <div class="stat-value ${spColor}">${sp >= 0 ? '+' : ''}${sp.toFixed(1)} bps</div>
+      <div class="stat-sub">${data.is_inverted ? 'Inverted' : 'Normal'}</div>
+    </div>`;
+  }
+  document.getElementById('yield-stats').innerHTML = statsHtml;
+
+  // Chart
+  const ctx = document.getElementById('yieldChart').getContext('2d');
+  if (yieldChart) yieldChart.destroy();
+  const labels = data.points.map(p => p.label);
+  const yields = data.points.map(p => p.yield_pct);
+  yieldChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Yield %',
+        data: yields,
+        borderColor: data.is_inverted ? '#ef4444' : '#3b82f6',
+        backgroundColor: data.is_inverted ? 'rgba(239,68,68,0.1)' : 'rgba(59,130,246,0.1)',
+        borderWidth: 2.5,
+        pointRadius: 5,
+        pointBackgroundColor: data.is_inverted ? '#ef4444' : '#3b82f6',
+        fill: true,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.parsed.y.toFixed(3)}%` } }
+      },
+      scales: {
+        x: { ticks: { color:'#94a3b8' }, grid: { color:'rgba(148,163,184,0.06)' } },
+        y: { ticks: { color:'#94a3b8', callback: v => v.toFixed(2) + '%' }, grid: { color:'rgba(148,163,184,0.06)' } }
+      }
+    }
+  });
+}
+
+// ── Sector Heatmap ───────────────────────────────────────────────────────────
+function showSectorPeriod(period, btn) {
+  if (btn) {
+    document.querySelectorAll('#sector-tab-row .tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  renderSectors(period);
+}
+
+function renderSectors(period) {
+  if (!sectorData) return;
+  const field = period === '1d' ? 'change_1d' : period === '1w' ? 'change_1w' : 'change_1mo';
+  const container = document.getElementById('sector-heatmap');
+  if (!sectorData.sectors.length) {
+    container.innerHTML = '<div class="empty-state">No sector data available.</div>';
+    return;
+  }
+  let html = '';
+  for (const s of sectorData.sectors) {
+    const val = s[field] || 0;
+    const pct = Math.min(Math.abs(val) / 5, 1);  // saturate at ±5%
+    const bg = val >= 0
+      ? `rgba(34,197,94,${0.1 + pct * 0.5})`
+      : `rgba(239,68,68,${0.1 + pct * 0.5})`;
+    const textColor = val >= 0 ? '#22c55e' : '#ef4444';
+    html += `<a href="/stock/${s.ticker}" class="sector-cell" style="background:${bg}">
+      <div class="sector-name">${s.name}</div>
+      <div class="sector-change" style="color:${textColor}">${val >= 0 ? '+' : ''}${val.toFixed(2)}%</div>
+      <div class="sector-ticker">${s.ticker}</div>
+    </a>`;
+  }
+  container.innerHTML = html;
+}
+
+// ── Market Movers ────────────────────────────────────────────────────────────
+function showMovers(type, btn) {
+  if (btn) {
+    document.querySelectorAll('#movers-tab-row .tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  renderMovers(type);
+}
+
+function renderMovers(type) {
+  if (!moversData) return;
+  const rows = moversData[type] || [];
+  const container = document.getElementById('movers-container');
+  if (!rows.length) { container.innerHTML = '<div class="empty-state">No data.</div>'; return; }
+
+  let html = `<table class="data-table"><thead><tr>
+    <th>#</th><th>Ticker</th><th>Name</th><th class="num">Price</th>
+    <th class="num">Day %</th>`;
+  if (type === 'active') html += '<th class="num">Vol Ratio</th>';
+  html += '<th class="num">Mkt Cap</th></tr></thead><tbody>';
+
+  rows.forEach((r, i) => {
+    const chg = coloredChangePct(r.change_pct);
+    const cap = formatMarketCap(r.market_cap);
+    html += `<tr>
+      <td class="dim">${i + 1}</td>
+      <td><a href="/stock/${r.ticker}" class="ticker-link">${r.ticker}</a></td>
+      <td class="dim">${truncate(r.name, 24)}</td>
+      <td class="num">${formatCurrency(r.price)}</td>
+      <td class="num">${chg}</td>`;
+    if (type === 'active') html += `<td class="num">${r.volume_ratio.toFixed(1)}x</td>`;
+    html += `<td class="num dim">${cap}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+// ── Earnings Calendar ────────────────────────────────────────────────────────
+function renderEarnings(data) {
+  const container = document.getElementById('earnings-container');
+  if (!data.earnings.length) {
+    container.innerHTML = '<div class="empty-state">No upcoming earnings in the next ' + data.days + ' days for your watchlist.</div>';
+    return;
+  }
+  let html = '<table class="data-table"><thead><tr><th>Ticker</th><th>Date</th><th class="num">Days Away</th></tr></thead><tbody>';
+  for (const e of data.earnings) {
+    const color = e.days_away <= 3 ? 'text-up' : '';
+    html += `<tr>
+      <td><a href="/stock/${e.ticker}" class="ticker-link">${e.ticker}</a></td>
+      <td>${e.date}</td>
+      <td class="num ${color}">${e.days_away}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+// ── Economic Calendar ────────────────────────────────────────────────────────
+function renderEcon(data) {
+  const container = document.getElementById('econ-container');
+  if (data.error) {
+    container.innerHTML = `<div class="empty-state dim">${data.error}</div>`;
+    return;
+  }
+  if (!data.events.length) {
+    container.innerHTML = '<div class="empty-state">No upcoming events found.</div>';
+    return;
+  }
+  let html = `<table class="data-table"><thead><tr>
+    <th>Event</th><th>Date</th><th class="num">Days Away</th>
+    <th class="num">Previous</th><th class="num">Actual</th><th>Importance</th>
+  </tr></thead><tbody>`;
+  for (const e of data.events) {
+    const impColor = e.importance === 'high' ? 'text-down' : 'dim';
+    html += `<tr>
+      <td>${e.name}</td>
+      <td>${e.release_date}</td>
+      <td class="num">${e.days_away}</td>
+      <td class="num dim">${e.previous !== null ? e.previous : '—'}</td>
+      <td class="num">${e.actual !== null ? e.actual : '—'}</td>
+      <td class="${impColor}">${e.importance}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+// ── News Feed ────────────────────────────────────────────────────────────────
+function renderNews(data) {
+  const container = document.getElementById('news-container');
+  if (data.error) { container.innerHTML = `<div class="empty-state dim">${data.error}</div>`; return; }
+  if (!data.items.length) { container.innerHTML = '<div class="empty-state">No headlines found.</div>'; return; }
+
+  let html = '<ul class="news-list">';
+  for (const item of data.items) {
+    const label = item.ticker || 'MKT';
+    const badgeClass = item.ticker ? 'badge badge-stock' : 'badge badge-etf';
+    html += `<li class="news-item">
+      <span class="${badgeClass}">${label}</span>
+      <a href="${item.url}" target="_blank" rel="noopener" class="news-headline">${item.headline}</a>
+      <span class="news-meta dim small">${item.source}</span>
+    </li>`;
+  }
+  html += '</ul>';
+  container.innerHTML = html;
+}
+
+loadMarket();
+</script>
+{% endblock %}

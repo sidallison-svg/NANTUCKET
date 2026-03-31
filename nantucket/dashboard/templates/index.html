@@ -44,6 +44,28 @@
   <div class="movers-grid" id="movers-grid"></div>
 </section>
 
+<!-- Sector Mini-Heatmap -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Sector Performance</h2>
+    <a href="/market" class="section-hint">Full market view →</a>
+  </div>
+  <div id="sector-mini-grid" class="sector-grid-mini">
+    <div class="loading-state">Loading sectors...</div>
+  </div>
+</section>
+
+<!-- News Feed -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Latest News</h2>
+    <a href="/market" class="section-hint">View all →</a>
+  </div>
+  <div id="news-feed-mini" class="news-feed">
+    <div class="loading-state">Loading news...</div>
+  </div>
+</section>
+
 <!-- Log a Trade -->
 <section class="section">
   <div class="section-header">
@@ -118,6 +140,63 @@ async function loadOverview() {
     const trades = await fetchJSON('/api/trades');
     renderTrades(trades);
   } catch(e) {}
+
+  // Sector mini-heatmap
+  try {
+    const sectors = await fetchJSON('/api/sectors');
+    renderSectorMini(sectors.sectors);
+  } catch(e) {}
+
+  // News feed (top 5 for watchlist)
+  try {
+    const newsFeed = await fetchJSON('/api/news?limit=5');
+    renderNewsMini(newsFeed);
+  } catch(e) {}
+}
+
+function renderSectorMini(sectors) {
+  const container = document.getElementById('sector-mini-grid');
+  if (!sectors || !sectors.length) {
+    container.innerHTML = '<div class="dim small">No sector data.</div>';
+    return;
+  }
+  let html = '';
+  for (const s of sectors) {
+    const val = s.change_1d || 0;
+    const pct = Math.min(Math.abs(val) / 5, 1);
+    const bg = val >= 0
+      ? `rgba(34,197,94,${0.1 + pct * 0.4})`
+      : `rgba(239,68,68,${0.1 + pct * 0.4})`;
+    const textColor = val >= 0 ? '#22c55e' : '#ef4444';
+    html += `<a href="/stock/${s.ticker}" class="sector-cell" style="background:${bg}">
+      <div class="sector-name">${s.name}</div>
+      <div class="sector-change" style="color:${textColor};font-size:13px">${val >= 0 ? '+' : ''}${val.toFixed(2)}%</div>
+    </a>`;
+  }
+  container.innerHTML = html;
+}
+
+function renderNewsMini(feed) {
+  const container = document.getElementById('news-feed-mini');
+  if (feed.error) {
+    container.innerHTML = `<div class="dim small" style="padding:12px">${feed.error}</div>`;
+    return;
+  }
+  if (!feed.items || !feed.items.length) {
+    container.innerHTML = '<div class="dim small" style="padding:12px">No headlines matched your watchlist.</div>';
+    return;
+  }
+  let html = '<ul class="news-list">';
+  for (const item of feed.items) {
+    const label = item.ticker || 'MKT';
+    html += `<li class="news-item">
+      <span class="badge badge-stock">${label}</span>
+      <a href="${item.url}" target="_blank" rel="noopener" class="news-headline">${item.headline}</a>
+      <span class="news-meta dim small">${item.source}</span>
+    </li>`;
+  }
+  html += '</ul>';
+  container.innerHTML = html;
 }
 
 function renderWatchlist(quotes) {

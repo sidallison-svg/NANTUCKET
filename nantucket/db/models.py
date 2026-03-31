@@ -54,5 +54,34 @@ CREATE TABLE IF NOT EXISTS saved_screens (
 )
 """
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Alerts: price alerts that fire when a ticker crosses a threshold
+# direction is 'above' or 'below'; active 1=waiting, 0=triggered
+# ──────────────────────────────────────────────────────────────────────────────
+CREATE_ALERTS = """
+CREATE TABLE IF NOT EXISTS alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker       TEXT    NOT NULL,
+    direction    TEXT    NOT NULL,   -- above | below
+    target       REAL    NOT NULL,
+    note         TEXT    NOT NULL DEFAULT '',
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    triggered_at TEXT
+)
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Econ cache: generic key/value cache for non-ticker data (FRED, news, etc.)
+# Kept separate from quote_cache so ticker-based keys don't collide
+# ──────────────────────────────────────────────────────────────────────────────
+CREATE_ECON_CACHE = """
+CREATE TABLE IF NOT EXISTS econ_cache (
+    cache_key  TEXT NOT NULL PRIMARY KEY,
+    data_json  TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 # Run all of these on startup
-ALL_TABLES = [CREATE_WATCHLIST, CREATE_TRADES, CREATE_SAVED_SCREENS]
+ALL_TABLES = [CREATE_WATCHLIST, CREATE_TRADES, CREATE_SAVED_SCREENS, CREATE_ALERTS, CREATE_ECON_CACHE]

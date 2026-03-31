@@ -13,6 +13,7 @@ URL: http://localhost:8000
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,20 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 @app.on_event("startup")
 async def startup():
     init_db()
+    asyncio.create_task(_alert_check_loop())
+
+
+async def _alert_check_loop():
+    """Background task: check price alerts every 60 seconds."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            from nantucket.alerts import check_alerts
+            quotes_list = get_watchlist_quotes()
+            quotes_dict = {q.ticker: q for q in quotes_list}
+            check_alerts(quotes_dict)
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -73,6 +88,18 @@ async def stock_detail(request: Request, ticker: str):
     return templates.TemplateResponse(
         request, "stock.html", {"ticker": ticker.upper()},
     )
+
+
+@app.get("/market", response_class=HTMLResponse)
+async def market_page(request: Request):
+    """Market overview: movers, sectors, yield curve, economic calendar."""
+    return templates.TemplateResponse(request, "market.html", {})
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_page(request: Request):
+    """Portfolio analytics: risk metrics, correlation matrix, tech summary."""
+    return templates.TemplateResponse(request, "analytics.html", {})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,6 +340,211 @@ async def api_presets():
         }
         for name, data in presets.items()
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bloomberg-style: news, movers, sectors, yield curve, earnings, econ calendar
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/news")
+async def api_news(
+    ticker: Optional[str] = Query(None),
+    limit: int = Query(15),
+):
+    """Return market news headlines filtered to watchlist or a specific ticker."""
+    from nantucket.data.news import get_news_for_tickers, get_market_news
+    if ticker:
+        feed = get_news_for_tickers([ticker.upper()], limit=limit)
+    else:
+        watchlist = get_watchlist()
+        tickers = [e["ticker"] for e in watchlist]
+        feed = get_news_for_tickers(tickers, limit=limit) if tickers else get_market_news(limit=limit)
+    return {
+        "items": [i.__dict__ for i in feed.items],
+        "fetched_at": feed.fetched_at,
+        "error": feed.error,
+    }
+
+
+@app.get("/api/movers")
+async def api_movers(limit: int = Query(10)):
+    """Return top S&P 100 gainers, losers, and most active."""
+    from nantucket.data.stocks import get_quotes_batch, TOP_100_SP500
+    quotes_dict = get_quotes_batch(list(TOP_100_SP500), max_workers=8)
+    all_q = [q for q in quotes_dict.values() if not q.error and q.price > 0]
+
+    def _to_row(q):
+        return {
+            "ticker": q.ticker, "name": q.name,
+            "price": round(q.price, 2),
+            "change": round(q.change, 2),
+            "change_pct": round(q.change_pct or 0, 2),
+            "volume": q.volume,
+            "volume_ratio": round(q.volume_ratio or 0, 2),
+            "market_cap": q.market_cap,
+            "sector": q.sector,
+        }
+
+    gainers = [_to_row(q) for q in sorted(all_q, key=lambda q: q.change_pct or 0, reverse=True)[:limit]]
+    losers  = [_to_row(q) for q in sorted(all_q, key=lambda q: q.change_pct or 0)[:limit]]
+    active  = [_to_row(q) for q in sorted(all_q, key=lambda q: q.volume_ratio or 0, reverse=True)[:limit]]
+    return {"gainers": gainers, "losers": losers, "active": active}
+
+
+@app.get("/api/sectors")
+async def api_sectors():
+    """Return S&P sector ETF performance heatmap."""
+    from nantucket.data.sectors import get_sector_heatmap
+    heatmap = get_sector_heatmap()
+    return {
+        "sectors": [s.__dict__ for s in heatmap.sectors],
+        "fetched_at": heatmap.fetched_at,
+        "error": heatmap.error,
+    }
+
+
+@app.get("/api/yield-curve")
+async def api_yield_curve():
+    """Return current US Treasury yield curve."""
+    from nantucket.data.treasury import get_yield_curve
+    curve = get_yield_curve()
+    return {
+        "points": [p.__dict__ for p in curve.points],
+        "is_inverted": curve.is_inverted,
+        "spread_10y3m": curve.spread_10y3m,
+        "fetched_at": curve.fetched_at,
+        "error": curve.error,
+    }
+
+
+@app.get("/api/earnings")
+async def api_earnings(days: int = Query(14)):
+    """Return upcoming earnings dates for watchlist tickers."""
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import date, timedelta
+    import yfinance as yf
+
+    watchlist = get_watchlist()
+    stock_tickers = [e["ticker"] for e in watchlist if e["asset_type"] in ("stock", "etf")]
+    today = date.today()
+    cutoff = today + timedelta(days=days)
+    results = []
+
+    def _check(ticker: str):
+        try:
+            cal = yf.Ticker(ticker).calendar
+            if not isinstance(cal, dict):
+                return
+            for ed in cal.get("Earnings Date", []):
+                if ed is None:
+                    continue
+                try:
+                    ed_date = ed.date() if hasattr(ed, "date") else date.fromisoformat(str(ed)[:10])
+                    if today <= ed_date <= cutoff:
+                        results.append({
+                            "ticker": ticker,
+                            "date": str(ed_date),
+                            "days_away": (ed_date - today).days,
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(_check, stock_tickers))
+
+    results.sort(key=lambda r: r["date"])
+    return {"earnings": results, "days": days}
+
+
+@app.get("/api/econ-calendar")
+async def api_econ_calendar():
+    """Return upcoming economic calendar events from FRED."""
+    from nantucket.data.econ import get_econ_calendar
+    cal = get_econ_calendar()
+    return {
+        "events": [e.__dict__ for e in cal.events],
+        "fetched_at": cal.fetched_at,
+        "error": cal.error,
+    }
+
+
+@app.get("/api/analytics")
+async def api_analytics(period: str = Query("1y")):
+    """Return portfolio risk/return analytics."""
+    from nantucket.analytics import get_portfolio_analytics
+    summary = get_portfolio_summary()
+    result = get_portfolio_analytics(summary.positions, period=period)
+    return result.__dict__
+
+
+@app.get("/api/correlation")
+async def api_correlation(
+    tickers: str = Query(..., description="Comma-separated tickers"),
+    period: str = Query("1y"),
+):
+    """Return pairwise correlation matrix for the given tickers."""
+    from nantucket.analytics import get_correlation_matrix
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    result = get_correlation_matrix(ticker_list, period=period)
+    return result.__dict__
+
+
+@app.get("/api/stock/{ticker}/indicators")
+async def api_indicators(ticker: str, period: str = Query("1y")):
+    """Return RSI, MACD, and Bollinger Band data for a stock."""
+    from nantucket.data.indicators import get_indicators
+    result = get_indicators(ticker.upper(), period=period)
+    return {
+        "ticker": result.ticker,
+        "rsi": result.rsi.__dict__ if result.rsi else None,
+        "macd": result.macd.__dict__ if result.macd else None,
+        "bollinger": result.bollinger.__dict__ if result.bollinger else None,
+        "error": result.error,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Alerts CRUD
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AlertCreate(BaseModel):
+    ticker: str
+    direction: str   # "above" | "below"
+    target: float
+    note: str = ""
+
+
+@app.get("/api/alerts")
+async def api_alerts_get(ticker: Optional[str] = Query(None)):
+    """Return active alerts, optionally filtered by ticker."""
+    from nantucket.alerts import get_alerts, get_recent_triggers
+    alerts = get_alerts(ticker=ticker, active_only=False)
+    triggers = get_recent_triggers(limit=5)
+    return {
+        "alerts": [a.__dict__ for a in alerts if a.active],
+        "recent_triggers": [a.__dict__ for a in triggers],
+    }
+
+
+@app.post("/api/alerts")
+async def api_alerts_create(body: AlertCreate):
+    """Create a new price alert."""
+    from nantucket.alerts import add_alert
+    try:
+        alert = add_alert(body.ticker.upper(), body.direction, body.target, body.note)
+        return {"success": True, "alert": alert.__dict__}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/alerts/{alert_id}")
+async def api_alerts_delete(alert_id: int):
+    """Delete an alert by ID."""
+    from nantucket.alerts import remove_alert
+    removed = remove_alert(alert_id)
+    return {"success": removed}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
