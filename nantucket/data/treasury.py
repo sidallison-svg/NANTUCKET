@@ -20,6 +20,7 @@ from typing import Optional
 import yfinance as yf
 
 from nantucket.data._session import get_session
+from nantucket.data.stocks import _fetch_chart
 
 # Cached in quote_cache using this synthetic key
 _CACHE_TICKER = "__YIELD_CURVE__"
@@ -68,19 +69,22 @@ def get_yield_curve() -> YieldCurve:
         )
 
     try:
-        tickers = [t[0] for t in YIELD_TICKERS]
-        raw = yf.download(tickers, period="5d", interval="1d", progress=False, auto_adjust=True, session=get_session())
-
         points: list[YieldPoint] = []
         yield_by_maturity: dict[str, float] = {}
 
         for yf_ticker, maturity, label, divisor in YIELD_TICKERS:
             try:
-                closes = raw["Close"][yf_ticker].dropna()
+                result = _fetch_chart(yf_ticker, range_="5d", interval="1d")
+                if not result:
+                    continue
+                closes_raw = (result.get("indicators", {})
+                                    .get("quote", [{}])[0]
+                                    .get("close") or [])
+                closes = [c for c in closes_raw if c is not None]
                 if len(closes) < 2:
                     continue
-                current = float(closes.iloc[-1]) / divisor
-                prev = float(closes.iloc[-2]) / divisor
+                current = closes[-1] / divisor
+                prev    = closes[-2] / divisor
                 change_bps = round((current - prev) * 100, 1)
                 points.append(YieldPoint(
                     maturity=maturity,

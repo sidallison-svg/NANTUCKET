@@ -1,8 +1,12 @@
 """
-Stock data via yfinance — free, no API key required, fast batch fetching.
+Stock data via Yahoo Finance chart API — free, no API key, no yfinance dependency.
 
-For watchlist/portfolio: uses yf.download() — one request for all tickers.
-For stock detail page: uses yf.Ticker().info for full fundamentals.
+Price fetching calls Yahoo Finance's v8/finance/chart endpoint directly via
+requests. This bypasses yfinance's curl_cffi backend which fails on some
+macOS configurations.
+
+Fundamentals (P/E, sector, etc.) still use yfinance .info since there is
+no simple public alternative; they are cached 24h to minimise calls.
 
 Cache strategy (SQLite):
 - Quotes:       15 minutes  (price / change / volume)
@@ -19,7 +23,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
-import yfinance as yf
 
 from nantucket.data._session import get_session
 
@@ -31,6 +34,9 @@ from nantucket.data._session import get_session
 QUOTE_CACHE_MINUTES   = 15
 OVERVIEW_CACHE_HOURS  = 24
 HISTORY_CACHE_MINUTES = 60
+
+_YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+_YF_CHART2 = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"  # fallback
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,7 +125,7 @@ def _set_cache(ticker: str, data_type: str, data: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Yahoo Finance chart API (direct, no yfinance)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _safe_float(val) -> Optional[float]:
@@ -132,8 +138,105 @@ def _safe_float(val) -> Optional[float]:
         return None
 
 
+def _fetch_chart(ticker: str, range_: str = "7d", interval: str = "1d") -> Optional[dict]:
+    """Call Yahoo Finance chart API directly. Returns the raw 'chart.result[0]' dict."""
+    params = {"interval": interval, "range": range_}
+    for url_tpl in (_YF_CHART, _YF_CHART2):
+        try:
+            url = url_tpl.format(ticker=ticker)
+            resp = get_session().get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("chart", {}).get("result") or []
+                if results:
+                    return results[0]
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_quote_from_chart(ticker: str) -> Optional[dict]:
+    """Fetch price/change/volume from Yahoo chart API, with 15-min cache."""
+    cached = _get_cached(ticker, "yf_quote", QUOTE_CACHE_MINUTES)
+    if cached:
+        return cached
+
+    result = _fetch_chart(ticker, range_="7d", interval="1d")
+    if not result:
+        return None
+
+    try:
+        meta   = result.get("meta", {})
+        price  = _safe_float(meta.get("regularMarketPrice")) or 0.0
+        prev   = _safe_float(meta.get("chartPreviousClose") or meta.get("previousClose")) or price
+        change = price - prev
+        change_pct = (change / prev * 100) if prev else 0.0
+        volume = int(meta.get("regularMarketVolume") or 0)
+
+        # 1-week change from timestamps array
+        closes = (result.get("indicators", {})
+                       .get("quote", [{}])[0]
+                       .get("close") or [])
+        closes = [c for c in closes if c is not None]
+        change_1w = 0.0
+        if len(closes) >= 6:
+            p6 = closes[-6]
+            if p6:
+                change_1w = ((price - p6) / p6 * 100)
+
+        q_data = {
+            "price": price, "change": change,
+            "change_pct": change_pct, "volume": volume,
+            "change_1w": change_1w,
+        }
+        if price > 0:
+            _set_cache(ticker, "yf_quote", q_data)
+        return q_data
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fundamentals via yfinance .info (cached 24h)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fetch_info(ticker: str) -> dict:
+    """Fetch P/E, sector, market cap etc. via yfinance, cached 24h."""
+    cached = _get_cached(ticker, "yf_info", OVERVIEW_CACHE_HOURS * 60)
+    if cached:
+        return cached
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker, session=get_session()).info or {}
+        result = {
+            "name":            info.get("longName") or info.get("shortName") or ticker,
+            "sector":          info.get("sector") or "",
+            "industry":        info.get("industry") or "",
+            "market_cap":      _safe_float(info.get("marketCap")) or 0.0,
+            "pe_ratio":        _safe_float(info.get("trailingPE")),
+            "pb_ratio":        _safe_float(info.get("priceToBook")),
+            "eps":             _safe_float(info.get("trailingEps")),
+            "dividend_yield":  (_safe_float(info.get("dividendYield")) or 0.0) * 100,
+            "week_52_high":    _safe_float(info.get("fiftyTwoWeekHigh")) or 0.0,
+            "week_52_low":     _safe_float(info.get("fiftyTwoWeekLow")) or 0.0,
+            "ma_50":           _safe_float(info.get("fiftyDayAverage")),
+            "ma_200":          _safe_float(info.get("twoHundredDayAverage")),
+            "avg_volume":      int(_safe_float(info.get("averageVolume")) or 0),
+            "revenue_growth":  _safe_float(info.get("revenueGrowth")),
+            "earnings_growth": _safe_float(info.get("earningsGrowth")),
+        }
+        if result["name"] != ticker:  # only cache if we got real data
+            _set_cache(ticker, "yf_info", result)
+        return result
+    except Exception:
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quote builder
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _build_quote(ticker: str, q: dict, info: dict) -> StockQuote:
-    """Assemble a StockQuote from price data dict + info dict."""
     price   = q.get("price", 0.0)
     avg_vol = info.get("avg_volume") or 0
     w52_low = info.get("week_52_low") or 0.0
@@ -174,8 +277,21 @@ def _build_quote(ticker: str, q: dict, info: dict) -> StockQuote:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Batch quote — uses yf.download() for speed (1 request for all tickers)
+# Public API
 # ──────────────────────────────────────────────────────────────────────────────
+
+def get_quote(ticker: str) -> StockQuote:
+    """Full quote for a single ticker."""
+    ticker = ticker.upper().strip()
+    try:
+        q_data = _fetch_quote_from_chart(ticker)
+        if not q_data or q_data["price"] == 0:
+            return StockQuote(ticker=ticker, error=f"No price data for {ticker}")
+        info = _fetch_info(ticker)
+        return _build_quote(ticker, q_data, info)
+    except Exception as e:
+        return StockQuote(ticker=ticker, error=str(e))
+
 
 def get_quotes_batch(
     tickers: list[str],
@@ -184,10 +300,8 @@ def get_quotes_batch(
     with_fundamentals: bool = False,
 ) -> dict[str, StockQuote]:
     """
-    Fetch quotes for many tickers in a single yfinance download request.
-    Falls back to individual fetches if batch fails.
-
-    with_fundamentals=True: also fetch P/E, P/B, sector etc. (needed for screener).
+    Fetch quotes for many tickers in parallel via Yahoo chart API.
+    with_fundamentals=True also fetches P/E, P/B, sector (for screener).
     """
     tickers = [t.upper() for t in tickers]
     if not tickers:
@@ -196,7 +310,6 @@ def get_quotes_batch(
     results: dict[str, StockQuote] = {}
     stale: list[str] = []
 
-    # Serve from cache where possible
     for t in tickers:
         cached_q = _get_cached(t, "yf_quote", QUOTE_CACHE_MINUTES)
         if cached_q:
@@ -205,79 +318,26 @@ def get_quotes_batch(
         else:
             stale.append(t)
 
-    if not stale:
-        if progress_callback:
-            progress_callback(len(tickers), len(tickers))
-        return results
-
-    # Batch download: ONE HTTP request for all stale tickers
-    try:
-        raw = yf.download(
-            stale,
-            period="7d",
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-            session=get_session(),
-        )
-
-        for ticker in stale:
-            try:
-                # yf.download returns MultiIndex when multiple tickers
-                if len(stale) == 1:
-                    close  = raw["Close"].dropna()
-                    volume = raw["Volume"].dropna()
-                else:
-                    close  = raw["Close"][ticker].dropna()
-                    volume = raw["Volume"][ticker].dropna()
-
-                if close.empty or len(close) < 2:
-                    results[ticker] = StockQuote(ticker=ticker, error="No price data")
-                    continue
-
-                price      = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
-                change     = price - prev_close
-                change_pct = (change / prev_close * 100) if prev_close else 0.0
-                vol        = int(volume.iloc[-1]) if not volume.empty else 0
-                change_1w  = 0.0
-                if len(close) >= 6:
-                    p6 = float(close.iloc[-6])
-                    change_1w = ((price - p6) / p6 * 100) if p6 else 0.0
-
-                q_data = {
-                    "price": price, "change": change,
-                    "change_pct": change_pct, "volume": vol,
-                    "change_1w": change_1w,
-                }
-                _set_cache(ticker, "yf_quote", q_data)
-
-                info = _get_cached(ticker, "yf_info", OVERVIEW_CACHE_HOURS * 60) or {}
-                results[ticker] = _build_quote(ticker, q_data, info)
-
-            except Exception as exc:
-                results[ticker] = StockQuote(ticker=ticker, error=str(exc))
-
-            if progress_callback:
-                progress_callback(len(results), len(tickers))
-
-    except Exception:
-        # Fallback: individual fetches in parallel
+    if stale:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(get_quote, t): t for t in stale}
+            futures = {pool.submit(_fetch_quote_from_chart, t): t for t in stale}
             for future in as_completed(futures):
                 t = futures[future]
                 try:
-                    results[t] = future.result()
+                    q_data = future.result()
+                    if q_data and q_data["price"] > 0:
+                        info = _get_cached(t, "yf_info", OVERVIEW_CACHE_HOURS * 60) or {}
+                        results[t] = _build_quote(t, q_data, info)
+                    else:
+                        results[t] = StockQuote(ticker=t, error="No price data")
                 except Exception as exc:
                     results[t] = StockQuote(ticker=t, error=str(exc))
                 if progress_callback:
                     progress_callback(len(results), len(tickers))
 
-    # If caller needs fundamentals (screener), fetch info for tickers that
-    # don't have it yet. Cached 24h so this only hits the API once per day.
     if with_fundamentals:
-        needs_info = [t for t in tickers if not results.get(t) or not results[t].sector]
+        needs_info = [t for t in tickers
+                      if t in results and not results[t].error and not results[t].sector]
         if needs_info:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(_fetch_info, t): t for t in needs_info}
@@ -286,7 +346,7 @@ def get_quotes_batch(
                     try:
                         info = future.result()
                         q = results.get(t)
-                        if q and info:
+                        if q and info and not q.error:
                             q_data = {
                                 "price": q.price, "change": q.change,
                                 "change_pct": q.change_pct, "volume": q.volume,
@@ -299,73 +359,13 @@ def get_quotes_batch(
     return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Single quote — full detail for stock page
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _fetch_info(ticker: str) -> dict:
-    """Fetch fundamentals from yfinance .info, cached 24h."""
-    cached = _get_cached(ticker, "yf_info", OVERVIEW_CACHE_HOURS * 60)
-    if cached:
-        return cached
-    try:
-        info = yf.Ticker(ticker, session=get_session()).info or {}
-        result = {
-            "name":            info.get("longName") or info.get("shortName") or ticker,
-            "sector":          info.get("sector") or "",
-            "industry":        info.get("industry") or "",
-            "market_cap":      _safe_float(info.get("marketCap")) or 0.0,
-            "pe_ratio":        _safe_float(info.get("trailingPE")),
-            "pb_ratio":        _safe_float(info.get("priceToBook")),
-            "eps":             _safe_float(info.get("trailingEps")),
-            "dividend_yield":  (_safe_float(info.get("dividendYield")) or 0.0) * 100,
-            "week_52_high":    _safe_float(info.get("fiftyTwoWeekHigh")) or 0.0,
-            "week_52_low":     _safe_float(info.get("fiftyTwoWeekLow")) or 0.0,
-            "ma_50":           _safe_float(info.get("fiftyDayAverage")),
-            "ma_200":          _safe_float(info.get("twoHundredDayAverage")),
-            "avg_volume":      int(_safe_float(info.get("averageVolume")) or 0),
-            "revenue_growth":  _safe_float(info.get("revenueGrowth")),
-            "earnings_growth": _safe_float(info.get("earningsGrowth")),
-        }
-        _set_cache(ticker, "yf_info", result)
-        return result
-    except Exception:
-        return {}
-
-
-def get_quote(ticker: str) -> StockQuote:
-    """Full quote for a single ticker (used on stock detail page)."""
-    ticker = ticker.upper().strip()
-    try:
-        # Use batch download for a single ticker to keep one code path
-        batch = get_quotes_batch([ticker])
-        q = batch.get(ticker)
-        if q is None:
-            return StockQuote(ticker=ticker, error="No data")
-
-        # Enrich with full fundamentals if not already cached
-        if not q.sector and not q.pe_ratio:
-            info = _fetch_info(ticker)
-            q = _build_quote(ticker,
-                {"price": q.price, "change": q.change, "change_pct": q.change_pct,
-                 "volume": q.volume, "change_1w": q.change_1w},
-                info)
-        return q
-    except Exception as e:
-        return StockQuote(ticker=ticker, error=str(e))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Historical data
-# ──────────────────────────────────────────────────────────────────────────────
-
 def get_history(
     ticker: str,
     period: str = "1y",
     outputsize: str = "full",
     interval: str = "1d",
 ) -> pd.DataFrame:
-    """OHLCV price history via yfinance, cached 60 minutes."""
+    """OHLCV price history via Yahoo chart API, cached 60 minutes."""
     cache_key = f"yf_hist_{period}_{interval}"
     cached = _get_cached(ticker, cache_key, HISTORY_CACHE_MINUTES)
     if cached:
@@ -376,15 +376,48 @@ def get_history(
         except Exception:
             pass
 
+    # Map period string to Yahoo Finance range parameter
+    range_map = {
+        "1d": "1d", "5d": "5d", "1mo": "1mo", "3mo": "3mo",
+        "6mo": "6mo", "1y": "1y", "2y": "2y", "5y": "5y", "10d": "5d",
+    }
+    yf_range = range_map.get(period, "1y")
+
+    result = _fetch_chart(ticker, range_=yf_range, interval=interval)
+    if not result:
+        return pd.DataFrame()
+
     try:
-        df = yf.Ticker(ticker, session=get_session()).history(period=period, interval=interval, auto_adjust=True)
-        if df.empty:
+        timestamps = result.get("timestamp", [])
+        indicators = result.get("indicators", {}).get("quote", [{}])[0]
+        opens   = indicators.get("open", [])
+        highs   = indicators.get("high", [])
+        lows    = indicators.get("low", [])
+        closes  = indicators.get("close", [])
+        volumes = indicators.get("volume", [])
+
+        rows = []
+        for i, ts in enumerate(timestamps):
+            c = closes[i] if i < len(closes) else None
+            if c is None:
+                continue
+            rows.append({
+                "Date":   pd.Timestamp(ts, unit="s"),
+                "Open":   opens[i]   if i < len(opens)   else c,
+                "High":   highs[i]   if i < len(highs)   else c,
+                "Low":    lows[i]    if i < len(lows)    else c,
+                "Close":  c,
+                "Volume": volumes[i] if i < len(volumes) else 0,
+            })
+
+        if not rows:
             return pd.DataFrame()
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
+
+        df = pd.DataFrame(rows).set_index("Date")
         df = df.sort_index()
         _set_cache(ticker, cache_key, {"data": df.to_dict()})
         return df
+
     except Exception:
         return pd.DataFrame()
 
