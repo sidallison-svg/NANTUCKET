@@ -324,9 +324,10 @@ def run_screen(
                 ticker_list,
                 max_workers=15,
                 progress_callback=on_progress,
+                with_fundamentals=True,
             )
     else:
-        quotes_dict = get_quotes_batch(ticker_list, max_workers=15)
+        quotes_dict = get_quotes_batch(ticker_list, max_workers=15, with_fundamentals=True)
 
     # Count errors
     errors = sum(1 for q in quotes_dict.values() if q.error)

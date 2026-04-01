@@ -181,10 +181,13 @@ def get_quotes_batch(
     tickers: list[str],
     max_workers: int = 10,
     progress_callback=None,
+    with_fundamentals: bool = False,
 ) -> dict[str, StockQuote]:
     """
     Fetch quotes for many tickers in a single yfinance download request.
     Falls back to individual fetches if batch fails.
+
+    with_fundamentals=True: also fetch P/E, P/B, sector etc. (needed for screener).
     """
     tickers = [t.upper() for t in tickers]
     if not tickers:
@@ -270,6 +273,28 @@ def get_quotes_batch(
                     results[t] = StockQuote(ticker=t, error=str(exc))
                 if progress_callback:
                     progress_callback(len(results), len(tickers))
+
+    # If caller needs fundamentals (screener), fetch info for tickers that
+    # don't have it yet. Cached 24h so this only hits the API once per day.
+    if with_fundamentals:
+        needs_info = [t for t in tickers if not results.get(t) or not results[t].sector]
+        if needs_info:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_fetch_info, t): t for t in needs_info}
+                for future in as_completed(futures):
+                    t = futures[future]
+                    try:
+                        info = future.result()
+                        q = results.get(t)
+                        if q and info:
+                            q_data = {
+                                "price": q.price, "change": q.change,
+                                "change_pct": q.change_pct, "volume": q.volume,
+                                "change_1w": q.change_1w,
+                            }
+                            results[t] = _build_quote(t, q_data, info)
+                    except Exception:
+                        pass
 
     return results
 
