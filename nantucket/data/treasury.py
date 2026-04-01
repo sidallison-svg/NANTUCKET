@@ -19,6 +19,8 @@ from typing import Optional
 
 import yfinance as yf
 
+from nantucket.data._session import get_session
+
 # Cached in quote_cache using this synthetic key
 _CACHE_TICKER = "__YIELD_CURVE__"
 _CACHE_TYPE = "yield_curve"
@@ -67,7 +69,7 @@ def get_yield_curve() -> YieldCurve:
 
     try:
         tickers = [t[0] for t in YIELD_TICKERS]
-        raw = yf.download(tickers, period="5d", interval="1d", progress=False, auto_adjust=True)
+        raw = yf.download(tickers, period="5d", interval="1d", progress=False, auto_adjust=True, session=get_session())
 
         points: list[YieldPoint] = []
         yield_by_maturity: dict[str, float] = {}

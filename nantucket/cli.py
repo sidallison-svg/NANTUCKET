@@ -794,6 +794,7 @@ def earnings(
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import date, timedelta
     import yfinance as yf
+    from nantucket.data._session import get_session
     from nantucket.watchlist import get_watchlist
 
     entries = get_watchlist()
@@ -810,7 +811,7 @@ def earnings(
 
     def _check(ticker: str) -> None:
         try:
-            cal = yf.Ticker(ticker).calendar
+            cal = yf.Ticker(ticker, session=get_session()).calendar
             if cal is None:
                 return
             # calendar is a dict with key 'Earnings Date' containing a list of dates

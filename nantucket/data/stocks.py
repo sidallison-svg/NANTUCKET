@@ -21,6 +21,8 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 
+from nantucket.data._session import get_session
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -213,6 +215,7 @@ def get_quotes_batch(
             interval="1d",
             progress=False,
             auto_adjust=True,
+            session=get_session(),
         )
 
         for ticker in stale:
@@ -281,7 +284,7 @@ def _fetch_info(ticker: str) -> dict:
     if cached:
         return cached
     try:
-        info = yf.Ticker(ticker).info or {}
+        info = yf.Ticker(ticker, session=get_session()).info or {}
         result = {
             "name":            info.get("longName") or info.get("shortName") or ticker,
             "sector":          info.get("sector") or "",
@@ -349,7 +352,7 @@ def get_history(
             pass
 
     try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+        df = yf.Ticker(ticker, session=get_session()).history(period=period, interval=interval, auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()

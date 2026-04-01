@@ -473,6 +473,7 @@ async def api_earnings(days: int = Query(14)):
     from concurrent.futures import ThreadPoolExecutor
     from datetime import date, timedelta
     import yfinance as yf
+    from nantucket.data._session import get_session
 
     watchlist = get_watchlist()
     stock_tickers = [e["ticker"] for e in watchlist if e["asset_type"] in ("stock", "etf")]
@@ -482,7 +483,7 @@ async def api_earnings(days: int = Query(14)):
 
     def _check(ticker: str):
         try:
-            cal = yf.Ticker(ticker).calendar
+            cal = yf.Ticker(ticker, session=get_session()).calendar
             if not isinstance(cal, dict):
                 return
             for ed in cal.get("Earnings Date", []):
