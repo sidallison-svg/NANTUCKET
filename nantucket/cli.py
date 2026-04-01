@@ -39,11 +39,13 @@ app = typer.Typer(
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
-watch_app = typer.Typer(help="Manage your watchlist.", no_args_is_help=True)
-trade_app = typer.Typer(help="Log paper trades.", no_args_is_help=True)
+watch_app  = typer.Typer(help="Manage your watchlist.", no_args_is_help=True)
+trade_app  = typer.Typer(help="Log paper trades.", no_args_is_help=True)
+alerts_app = typer.Typer(help="Manage price alerts.", no_args_is_help=True)
 
-app.add_typer(watch_app, name="watch")
-app.add_typer(trade_app, name="trade")
+app.add_typer(watch_app,  name="watch")
+app.add_typer(trade_app,  name="trade")
+app.add_typer(alerts_app, name="alerts")
 
 console = Console()
 
@@ -712,6 +714,381 @@ def quote(
         )
 
     console.print(t)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket movers
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def movers(
+    limit: int  = typer.Option(10, "--limit", "-n",  help="Number of movers to show per category"),
+    type: str   = typer.Option("all", "--type", "-t", help="gainers | losers | active | all"),
+):
+    """Show top S&P 500 market movers (gainers, losers, most active)."""
+    from nantucket.data.stocks import get_quotes_batch, TOP_100_SP500
+
+    console.print("[dim]Fetching S&P 100 quotes...[/dim]")
+    quotes_dict = get_quotes_batch(list(TOP_100_SP500), max_workers=8)
+    all_quotes = [q for q in quotes_dict.values() if not q.error and q.price > 0]
+
+    gainers = sorted(all_quotes, key=lambda q: q.change_pct or 0, reverse=True)[:limit]
+    losers  = sorted(all_quotes, key=lambda q: q.change_pct or 0)[:limit]
+    active  = sorted(all_quotes, key=lambda q: q.volume_ratio or 0, reverse=True)[:limit]
+
+    def _movers_table(title: str, rows: list, sort_col: str = "change_pct") -> Table:
+        t = Table(title=title, box=box.ROUNDED, border_style="dim")
+        t.add_column("#",       width=3,  justify="right", style="dim")
+        t.add_column("Ticker",  width=8,  style="bold")
+        t.add_column("Name",    width=26, style="dim", no_wrap=True)
+        t.add_column("Price",   width=10, justify="right")
+        t.add_column("Day %",   width=9,  justify="right")
+        t.add_column("Volume",  width=9,  justify="right", style="dim")
+        t.add_column("Mkt Cap", width=9,  justify="right", style="dim")
+        for i, q in enumerate(rows, 1):
+            name = (q.name[:24] + "…") if len(q.name) > 25 else q.name
+            t.add_row(
+                str(i), q.ticker, name,
+                _fmt_price(q.price),
+                _fmt_pct(q.change_pct),
+                _fmt_vol(q.volume),
+                _fmt_mktcap(q.market_cap),
+            )
+        return t
+
+    show = type.lower()
+    if show in ("all", "gainers"):
+        console.print(_movers_table("[bold green]Top Gainers[/bold green]", gainers))
+    if show in ("all", "losers"):
+        console.print(_movers_table("[bold red]Top Losers[/bold red]", losers))
+    if show in ("all", "active"):
+        t = Table(title="[bold yellow]Most Active[/bold yellow]", box=box.ROUNDED, border_style="dim")
+        t.add_column("#",         width=3,  justify="right", style="dim")
+        t.add_column("Ticker",    width=8,  style="bold")
+        t.add_column("Name",      width=26, style="dim", no_wrap=True)
+        t.add_column("Price",     width=10, justify="right")
+        t.add_column("Day %",     width=9,  justify="right")
+        t.add_column("Vol Ratio", width=10, justify="right")
+        t.add_column("Volume",    width=9,  justify="right", style="dim")
+        for i, q in enumerate(active, 1):
+            name = (q.name[:24] + "…") if len(q.name) > 25 else q.name
+            t.add_row(
+                str(i), q.ticker, name,
+                _fmt_price(q.price),
+                _fmt_pct(q.change_pct),
+                f"{q.volume_ratio:.1f}x" if q.volume_ratio else "—",
+                _fmt_vol(q.volume),
+            )
+        console.print(t)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket earnings
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def earnings(
+    days: int = typer.Option(14, "--days", "-d", help="Look-ahead window in days"),
+):
+    """Show upcoming earnings dates for your watchlist tickers."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import date, timedelta
+    import yfinance as yf
+    from nantucket.data._session import get_session
+    from nantucket.watchlist import get_watchlist
+
+    entries = get_watchlist()
+    stock_tickers = [e["ticker"] for e in entries if e["asset_type"] in ("stock", "etf")]
+    if not stock_tickers:
+        console.print("[yellow]No stocks/ETFs in your watchlist.[/yellow]")
+        return
+
+    today = date.today()
+    cutoff = today + timedelta(days=days)
+    console.print(f"[dim]Checking earnings for {len(stock_tickers)} tickers...[/dim]")
+
+    results: list[dict] = []
+
+    def _check(ticker: str) -> None:
+        try:
+            cal = yf.Ticker(ticker, session=get_session()).calendar
+            if cal is None:
+                return
+            # calendar is a dict with key 'Earnings Date' containing a list of dates
+            if isinstance(cal, dict):
+                dates = cal.get("Earnings Date", [])
+                if not isinstance(dates, list):
+                    dates = [dates]
+            else:
+                return
+            for ed in dates:
+                if ed is None:
+                    continue
+                try:
+                    ed_date = ed.date() if hasattr(ed, "date") else date.fromisoformat(str(ed)[:10])
+                    if today <= ed_date <= cutoff:
+                        results.append({
+                            "ticker": ticker,
+                            "date": str(ed_date),
+                            "days_away": (ed_date - today).days,
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(_check, stock_tickers))
+
+    if not results:
+        console.print(f"[yellow]No earnings scheduled in the next {days} days for your watchlist.[/yellow]")
+        return
+
+    results.sort(key=lambda r: r["date"])
+    t = Table(
+        title=f"[bold]Upcoming Earnings[/bold]  [dim](next {days} days)[/dim]",
+        box=box.ROUNDED, border_style="dim",
+    )
+    t.add_column("Ticker",     style="bold", width=8)
+    t.add_column("Date",       width=12)
+    t.add_column("Days Away",  width=10, justify="right")
+
+    for r in results:
+        days_text = Text(str(r["days_away"]), style="green" if r["days_away"] <= 3 else "")
+        t.add_row(r["ticker"], r["date"], days_text)
+
+    console.print(t)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket yield-curve
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.command(name="yield-curve")
+def yield_curve():
+    """Display the current US Treasury yield curve."""
+    from nantucket.data.treasury import get_yield_curve
+
+    console.print("[dim]Fetching Treasury yields...[/dim]")
+    curve = get_yield_curve()
+
+    if curve.error and not curve.points:
+        console.print(f"[red]Error: {curve.error}[/red]")
+        raise typer.Exit(1)
+
+    t = Table(
+        title="[bold]US Treasury Yield Curve[/bold]",
+        box=box.ROUNDED, border_style="dim",
+    )
+    t.add_column("Maturity",  width=12)
+    t.add_column("Yield %",   width=10, justify="right")
+    t.add_column("1D Chg (bps)", width=14, justify="right")
+
+    for p in curve.points:
+        bps_text = _fmt_pct(p.change_bps / 100) if p.change_bps != 0 else Text("—", style="dim")
+        t.add_row(p.label, f"{p.yield_pct:.3f}%", bps_text)
+
+    console.print(t)
+
+    spread_color = "red" if curve.is_inverted else "green"
+    console.print(f"\n  [bold]10Y–3M Spread:[/bold] [{spread_color}]{curve.spread_10y3m:+.1f} bps[/{spread_color}]", end="")
+    if curve.is_inverted:
+        console.print("  [bold red]⚠ INVERTED[/bold red]")
+    else:
+        console.print()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket news
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def news(
+    ticker: Optional[str] = typer.Argument(None, help="Filter to a specific ticker (optional)"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Number of headlines to show"),
+):
+    """Show market news headlines for your watchlist (or a specific ticker)."""
+    from nantucket.data.news import get_news_for_tickers, get_market_news
+    from nantucket.watchlist import get_watchlist
+
+    if ticker:
+        tickers = [ticker.upper()]
+        console.print(f"[dim]Fetching news for {ticker.upper()}...[/dim]")
+        feed = get_news_for_tickers(tickers, limit=limit)
+    else:
+        entries = get_watchlist()
+        tickers = [e["ticker"] for e in entries]
+        if tickers:
+            console.print(f"[dim]Fetching news for {len(tickers)} watchlist tickers...[/dim]")
+            feed = get_news_for_tickers(tickers, limit=limit)
+        else:
+            console.print("[dim]Fetching general market news...[/dim]")
+            feed = get_market_news(limit=limit)
+
+    if feed.error:
+        console.print(f"[yellow]{feed.error}[/yellow]")
+        return
+
+    if not feed.items:
+        console.print("[yellow]No matching headlines found.[/yellow]")
+        return
+
+    t = Table(
+        title=f"[bold]News[/bold]  [dim]({len(feed.items)} headlines)[/dim]",
+        box=box.ROUNDED, border_style="dim",
+    )
+    t.add_column("Ticker",   width=8,  style="bold")
+    t.add_column("Source",   width=14, style="dim")
+    t.add_column("Headline", width=60, no_wrap=True)
+
+    for item in feed.items:
+        headline = (item.headline[:57] + "…") if len(item.headline) > 58 else item.headline
+        t.add_row(item.ticker or "MKT", item.source, headline)
+
+    console.print(t)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket analytics
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def analytics(
+    period: str = typer.Option("1y", "--period", "-p", help="Analysis period: 6mo, 1y, 2y"),
+):
+    """Show portfolio risk/return analytics: Sharpe, drawdown, beta, and more."""
+    from nantucket.portfolio import get_portfolio_summary
+    from nantucket.analytics import get_portfolio_analytics
+
+    console.print("[dim]Computing portfolio analytics (fetching price history)...[/dim]")
+    summary = get_portfolio_summary()
+
+    if not summary.positions:
+        console.print("[yellow]No open positions. Log some trades first.[/yellow]")
+        raise typer.Exit(0)
+
+    result = get_portfolio_analytics(summary.positions, period=period)
+
+    if result.error and result.sharpe_ratio is None:
+        console.print(f"[red]Error: {result.error}[/red]")
+        raise typer.Exit(1)
+
+    def _fmt_metric(val: float | None, suffix: str = "") -> Text:
+        if val is None:
+            return Text("N/A", style="dim")
+        color = "green" if val >= 0 else "red"
+        return Text(f"{val:+.3f}{suffix}", style=color)
+
+    t = Table(
+        title=f"[bold]Portfolio Analytics[/bold]  [dim]({period} period · {len(summary.positions)} positions)[/dim]",
+        box=box.ROUNDED, border_style="dim", show_header=False,
+    )
+    t.add_column("Metric", style="bold", width=22)
+    t.add_column("Value",  width=20)
+    t.add_column("Note",   style="dim", width=40)
+
+    t.add_row("Total Return",      _fmt_metric(result.total_return, "%"),     "Period return on cost basis")
+    t.add_row("Ann. Volatility",   Text(f"{result.volatility_annualized:.2f}%", style=""), "Annualised daily std deviation")
+    t.add_row("Sharpe Ratio",      _fmt_metric(result.sharpe_ratio),          ">1.0 good, >2.0 excellent")
+    t.add_row("Sortino Ratio",     _fmt_metric(result.sortino_ratio),         "Sharpe using downside vol only")
+    t.add_row("Max Drawdown",      _fmt_metric(result.max_drawdown, "%"),     f"{result.max_drawdown_start} → {result.max_drawdown_end}")
+    t.add_row("Beta vs SPY",       _fmt_metric(result.beta_vs_spy),           "<1 = less volatile than market")
+    t.add_row("Alpha vs SPY",      _fmt_metric(result.alpha_vs_spy, "%/yr"),  "Excess return over benchmark")
+
+    console.print(t)
+    if result.error:
+        console.print(f"[yellow]Note: {result.error}[/yellow]")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# nantucket alerts
+# ──────────────────────────────────────────────────────────────────────────────
+
+@alerts_app.command("add")
+def alerts_add(
+    ticker: str = typer.Argument(..., help="Ticker symbol, e.g. AAPL"),
+    above: Optional[float] = typer.Option(None, "--above", help="Fire when price rises above this level"),
+    below: Optional[float] = typer.Option(None, "--below", help="Fire when price falls below this level"),
+    note:  str  = typer.Option("",   "--note",  "-n", help="Optional note for this alert"),
+):
+    """Add a price alert for a ticker."""
+    from nantucket.alerts import add_alert
+
+    if above is not None and below is not None:
+        console.print("[red]Specify only one of --above or --below.[/red]")
+        raise typer.Exit(1)
+    if above is None and below is None:
+        console.print("[red]Specify either --above PRICE or --below PRICE.[/red]")
+        raise typer.Exit(1)
+
+    direction = "above" if above is not None else "below"
+    target    = above if above is not None else below
+
+    alert = add_alert(ticker.upper(), direction, target, note)
+    dir_color = "green" if direction == "above" else "red"
+    console.print(
+        f"[{dir_color}]✓[/{dir_color}] Alert set: [bold]{ticker.upper()}[/bold] "
+        f"[{dir_color}]{direction} ${target:,.2f}[/{dir_color}]"
+        + (f"  [dim]{note}[/dim]" if note else "")
+        + f"  [dim](id: {alert.id})[/dim]"
+    )
+
+
+@alerts_app.command("show")
+def alerts_show(
+    ticker: Optional[str] = typer.Argument(None, help="Filter to a specific ticker"),
+    all: bool = typer.Option(False, "--all", help="Include triggered alerts"),
+):
+    """Show price alerts."""
+    from nantucket.alerts import get_alerts, get_recent_triggers
+
+    alerts = get_alerts(ticker=ticker, active_only=not all)
+
+    if not alerts:
+        console.print("[yellow]No alerts found.[/yellow]")
+        console.print("[dim]Add one: nantucket alerts add AAPL --above 200[/dim]")
+        return
+
+    t = Table(
+        title=f"[bold]Price Alerts[/bold]  [dim]({'all' if all else 'active only'})[/dim]",
+        box=box.ROUNDED, border_style="dim",
+    )
+    t.add_column("ID",        width=5,  justify="right", style="dim")
+    t.add_column("Ticker",    width=8,  style="bold")
+    t.add_column("Direction", width=8)
+    t.add_column("Target",    width=12, justify="right")
+    t.add_column("Note",      width=20, style="dim")
+    t.add_column("Status",    width=10)
+    t.add_column("Created",   width=12, style="dim")
+
+    for a in alerts:
+        dir_color = "green" if a.direction == "above" else "red"
+        status = Text("active", style="green") if a.active else Text("triggered", style="dim")
+        t.add_row(
+            str(a.id),
+            a.ticker,
+            Text(a.direction, style=dir_color),
+            f"${a.target:,.2f}",
+            a.note or "—",
+            status,
+            a.created_at[:10],
+        )
+
+    console.print(t)
+
+
+@alerts_app.command("remove")
+def alerts_remove(
+    alert_id: int = typer.Argument(..., help="Alert ID to remove (see nantucket alerts show)"),
+):
+    """Remove a price alert by ID."""
+    from nantucket.alerts import remove_alert
+
+    removed = remove_alert(alert_id)
+    if removed:
+        console.print(f"[red]✗ Removed alert #{alert_id}[/red]")
+    else:
+        console.print(f"[yellow]Alert #{alert_id} not found.[/yellow]")
 
 
 if __name__ == "__main__":

@@ -174,8 +174,10 @@ def _passes_filters(q: StockQuote, f: ScreenFilters) -> bool:
     """
     Check if a StockQuote passes all active filters.
 
-    Each filter is checked only if it's not None.
-    If a filter is active but the quote is missing that data (None), the quote fails.
+    For fundamental fields (P/E, P/B, sector etc.) where data may be
+    unavailable: if the value is None we let the stock through rather than
+    excluding it — "unknown" is not the same as "failing".
+    For price/volume/momentum filters we always have data so None = fail.
     """
     if q.error:
         return False
@@ -184,28 +186,30 @@ def _passes_filters(q: StockQuote, f: ScreenFilters) -> bool:
     if q.asset_type not in f.asset_types:
         return False
 
-    # ── Valuation ────────────────────────────────────────────────────────────
-    if f.pe_min is not None:
-        if q.pe_ratio is None or q.pe_ratio < f.pe_min:
+    # ── Valuation (skip if data missing) ─────────────────────────────────────
+    if f.pe_min is not None and q.pe_ratio is not None:
+        if q.pe_ratio < f.pe_min:
             return False
-    if f.pe_max is not None:
-        if q.pe_ratio is None or q.pe_ratio <= 0 or q.pe_ratio > f.pe_max:
+    if f.pe_max is not None and q.pe_ratio is not None and q.pe_ratio > 0:
+        if q.pe_ratio > f.pe_max:
             return False
-    if f.pb_min is not None:
-        if q.pb_ratio is None or q.pb_ratio < f.pb_min:
+    if f.pb_min is not None and q.pb_ratio is not None:
+        if q.pb_ratio < f.pb_min:
             return False
-    if f.pb_max is not None:
-        if q.pb_ratio is None or q.pb_ratio <= 0 or q.pb_ratio > f.pb_max:
+    if f.pb_max is not None and q.pb_ratio is not None and q.pb_ratio > 0:
+        if q.pb_ratio > f.pb_max:
             return False
-    if f.eps_min is not None:
-        if q.eps is None or q.eps < f.eps_min:
+    if f.eps_min is not None and q.eps is not None:
+        if q.eps < f.eps_min:
             return False
 
     # ── Size ─────────────────────────────────────────────────────────────────
-    if f.market_cap_min is not None and q.market_cap < f.market_cap_min:
-        return False
-    if f.market_cap_max is not None and q.market_cap > f.market_cap_max:
-        return False
+    if f.market_cap_min is not None and q.market_cap > 0:
+        if q.market_cap < f.market_cap_min:
+            return False
+    if f.market_cap_max is not None and q.market_cap > 0:
+        if q.market_cap > f.market_cap_max:
+            return False
 
     # ── Volume ───────────────────────────────────────────────────────────────
     if f.volume_min is not None and q.volume < f.volume_min:
@@ -214,8 +218,8 @@ def _passes_filters(q: StockQuote, f: ScreenFilters) -> bool:
         return False
 
     # ── Income ───────────────────────────────────────────────────────────────
-    if f.div_yield_min is not None:
-        if q.dividend_yield is None or q.dividend_yield < f.div_yield_min:
+    if f.div_yield_min is not None and q.dividend_yield is not None:
+        if q.dividend_yield < f.div_yield_min:
             return False
 
     # ── Price action ─────────────────────────────────────────────────────────
@@ -231,21 +235,21 @@ def _passes_filters(q: StockQuote, f: ScreenFilters) -> bool:
         return False
     if f.above_200ma is True and not q.above_200ma:
         return False
-    if f.near_52w_low is not None:
+    if f.near_52w_low is not None and q.price_vs_52w_low_pct > 0:
         if q.price_vs_52w_low_pct > f.near_52w_low:
             return False
 
-    # ── Fundamental growth ───────────────────────────────────────────────────
-    if f.revenue_growth_min is not None:
-        if q.revenue_growth is None or q.revenue_growth < f.revenue_growth_min:
+    # ── Fundamental growth (skip if data missing) ─────────────────────────────
+    if f.revenue_growth_min is not None and q.revenue_growth is not None:
+        if q.revenue_growth < f.revenue_growth_min:
             return False
-    if f.earnings_growth_min is not None:
-        if q.earnings_growth is None or q.earnings_growth < f.earnings_growth_min:
+    if f.earnings_growth_min is not None and q.earnings_growth is not None:
+        if q.earnings_growth < f.earnings_growth_min:
             return False
 
-    # ── Sector ───────────────────────────────────────────────────────────────
-    if f.sector:
-        if not q.sector or f.sector.lower() not in q.sector.lower():
+    # ── Sector (skip if data missing) ────────────────────────────────────────
+    if f.sector and q.sector:
+        if f.sector.lower() not in q.sector.lower():
             return False
 
     return True
@@ -324,9 +328,10 @@ def run_screen(
                 ticker_list,
                 max_workers=15,
                 progress_callback=on_progress,
+                with_fundamentals=True,
             )
     else:
-        quotes_dict = get_quotes_batch(ticker_list, max_workers=15)
+        quotes_dict = get_quotes_batch(ticker_list, max_workers=15, with_fundamentals=True)
 
     # Count errors
     errors = sum(1 for q in quotes_dict.values() if q.error)

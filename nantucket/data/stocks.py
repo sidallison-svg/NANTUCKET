@@ -1,82 +1,68 @@
 """
-Alpha Vantage data wrapper for stocks and ETFs.
+Stock data via Yahoo Finance chart API — free, no API key, no yfinance dependency.
 
-Alpha Vantage is a free stock data API that works reliably without SSL issues.
-Free tier: 25 requests/day — we make this work with smart SQLite caching:
-  - Quotes cached for 15 minutes (so re-running watch show is free)
-  - Fundamentals (P/E, sector, etc.) cached for 24 hours
-  - History cached for 24 hours
+Price fetching calls Yahoo Finance's v8/finance/chart endpoint directly via
+requests. This bypasses yfinance's curl_cffi backend which fails on some
+macOS configurations.
 
-Setup: Set ALPHA_VANTAGE_KEY in your .env file.
-Get a free key at: https://www.alphavantage.co/support/#api-key
+Fundamentals (P/E, sector, etc.) still use yfinance .info since there is
+no simple public alternative; they are cached 24h to minimise calls.
 
-API docs: https://www.alphavantage.co/documentation/
+Cache strategy (SQLite):
+- Quotes:       15 minutes  (price / change / volume)
+- Fundamentals: 24 hours    (P/E, sector, market cap)
+- History:      60 minutes  (OHLCV daily bars)
 """
 
 from __future__ import annotations
 
 import json
-import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
-import requests
+
+from nantucket.data._session import get_session
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-AV_BASE = "https://www.alphavantage.co/query"
-QUOTE_CACHE_MINUTES = 15      # How long to cache price quotes
-OVERVIEW_CACHE_HOURS = 24     # How long to cache fundamentals
-HISTORY_CACHE_HOURS = 24      # How long to cache price history
+QUOTE_CACHE_MINUTES   = 15
+OVERVIEW_CACHE_HOURS  = 24
+HISTORY_CACHE_MINUTES = 60
 
-
-def _get_api_key() -> str:
-    key = os.environ.get("ALPHA_VANTAGE_KEY", "")
-    if not key:
-        raise RuntimeError(
-            "ALPHA_VANTAGE_KEY not set!\n"
-            "Add it to your .env file: ALPHA_VANTAGE_KEY=your-key\n"
-            "Get a free key at: https://www.alphavantage.co/support/#api-key"
-        )
-    return key
+_YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+_YF_CHART2 = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"  # fallback
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data model (same interface as before — nothing else in the app changes)
+# Data model
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class StockQuote:
-    """
-    All the key metrics for a single stock/ETF at a point in time.
-
-    Fields marked Optional[float] can be None — we handle that in the
-    screener and display layers rather than crashing on missing data.
-    """
     ticker: str
     name: str = ""
     price: float = 0.0
-    change: float = 0.0           # Dollar change from previous close
-    change_pct: float = 0.0       # Percent change from previous close
-    volume: int = 0               # Today's volume so far
-    avg_volume: int = 0           # Average daily volume
-    volume_ratio: float = 0.0     # volume / avg_volume  (>1.5 = "hot")
-    market_cap: float = 0.0       # Total market value in dollars
-    pe_ratio: Optional[float] = None    # Price / Earnings (trailing 12mo)
-    pb_ratio: Optional[float] = None    # Price / Book value
-    eps: Optional[float] = None         # Earnings per share (trailing 12mo)
-    dividend_yield: Optional[float] = None   # Annual dividend yield in %
+    change: float = 0.0
+    change_pct: float = 0.0
+    volume: int = 0
+    avg_volume: int = 0
+    volume_ratio: float = 0.0
+    market_cap: float = 0.0
+    pe_ratio: Optional[float] = None
+    pb_ratio: Optional[float] = None
+    eps: Optional[float] = None
+    dividend_yield: Optional[float] = None
     sector: str = ""
     industry: str = ""
     week_52_high: float = 0.0
     week_52_low: float = 0.0
-    price_vs_52w_low_pct: float = 0.0   # % above 52-week low
+    price_vs_52w_low_pct: float = 0.0
     ma_50: Optional[float] = None
     ma_200: Optional[float] = None
     above_50ma: bool = False
@@ -89,7 +75,7 @@ class StockQuote:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SQLite cache — avoids burning API requests on repeated calls
+# SQLite cache
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _get_cache_conn():
@@ -109,18 +95,15 @@ def _get_cache_conn():
 
 
 def _get_cached(ticker: str, data_type: str, max_age_minutes: int) -> Optional[dict]:
-    """Return cached data if it's fresh enough, otherwise None."""
     try:
         conn = _get_cache_conn()
         row = conn.execute(
-            """SELECT data_json, fetched_at FROM quote_cache
-               WHERE ticker = ? AND data_type = ?""",
+            "SELECT data_json, fetched_at FROM quote_cache WHERE ticker=? AND data_type=?",
             (ticker.upper(), data_type),
         ).fetchone()
         if not row:
             return None
-        fetched = datetime.fromisoformat(row["fetched_at"])
-        age = datetime.now() - fetched
+        age = datetime.now() - datetime.fromisoformat(row["fetched_at"])
         if age < timedelta(minutes=max_age_minutes):
             return json.loads(row["data_json"])
     except Exception:
@@ -129,7 +112,6 @@ def _get_cached(ticker: str, data_type: str, max_age_minutes: int) -> Optional[d
 
 
 def _set_cache(ticker: str, data_type: str, data: dict) -> None:
-    """Store data in the cache."""
     try:
         conn = _get_cache_conn()
         conn.execute(
@@ -143,236 +125,271 @@ def _set_cache(ticker: str, data_type: str, data: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Alpha Vantage API calls
+# Yahoo Finance chart API (direct, no yfinance)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _fetch_global_quote(ticker: str) -> Optional[dict]:
-    """
-    Fetch current price, change, and volume from Alpha Vantage GLOBAL_QUOTE.
-    Uses cache first — only hits the API if data is older than 15 minutes.
-    """
-    cached = _get_cached(ticker, "quote", QUOTE_CACHE_MINUTES)
+def _safe_float(val) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        f = float(val)
+        return None if f != f else f  # NaN → None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_chart(ticker: str, range_: str = "7d", interval: str = "1d") -> Optional[dict]:
+    """Call Yahoo Finance chart API directly. Returns the raw 'chart.result[0]' dict."""
+    params = {"interval": interval, "range": range_}
+    for url_tpl in (_YF_CHART, _YF_CHART2):
+        try:
+            url = url_tpl.format(ticker=ticker)
+            resp = get_session().get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("chart", {}).get("result") or []
+                if results:
+                    return results[0]
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_quote_from_chart(ticker: str) -> Optional[dict]:
+    """Fetch price/change/volume from Yahoo chart API, with 15-min cache."""
+    cached = _get_cached(ticker, "yf_quote", QUOTE_CACHE_MINUTES)
     if cached:
         return cached
 
+    result = _fetch_chart(ticker, range_="7d", interval="1d")
+    if not result:
+        return None
+
     try:
-        resp = requests.get(AV_BASE, params={
-            "function": "GLOBAL_QUOTE",
-            "symbol": ticker,
-            "apikey": _get_api_key(),
-        }, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        meta   = result.get("meta", {})
+        price  = _safe_float(meta.get("regularMarketPrice")) or 0.0
+        prev   = _safe_float(meta.get("chartPreviousClose") or meta.get("previousClose")) or price
+        change = price - prev
+        change_pct = (change / prev * 100) if prev else 0.0
+        volume = int(meta.get("regularMarketVolume") or 0)
 
-        q = data.get("Global Quote", {})
-        if not q or not q.get("05. price"):
-            return None
+        # 1-week change from timestamps array
+        closes = (result.get("indicators", {})
+                       .get("quote", [{}])[0]
+                       .get("close") or [])
+        closes = [c for c in closes if c is not None]
+        change_1w = 0.0
+        if len(closes) >= 6:
+            p6 = closes[-6]
+            if p6:
+                change_1w = ((price - p6) / p6 * 100)
 
-        result = {
-            "price":      float(q.get("05. price", 0)),
-            "open":       float(q.get("02. open", 0)),
-            "high":       float(q.get("03. high", 0)),
-            "low":        float(q.get("04. low", 0)),
-            "prev_close": float(q.get("08. previous close", 0)),
-            "change":     float(q.get("09. change", 0)),
-            "change_pct": float(q.get("10. change percent", "0%").replace("%", "")),
-            "volume":     int(q.get("06. volume", 0)),
+        q_data = {
+            "price": price, "change": change,
+            "change_pct": change_pct, "volume": volume,
+            "change_1w": change_1w,
         }
-        _set_cache(ticker, "quote", result)
-        return result
-
+        if price > 0:
+            _set_cache(ticker, "yf_quote", q_data)
+        return q_data
     except Exception:
         return None
 
 
-def _fetch_overview(ticker: str) -> Optional[dict]:
-    """
-    Fetch company fundamentals from Alpha Vantage OVERVIEW.
-    Cached for 24 hours since fundamentals don't change often.
-    Costs 1 API request.
-    """
-    cached = _get_cached(ticker, "overview", OVERVIEW_CACHE_HOURS * 60)
+# ──────────────────────────────────────────────────────────────────────────────
+# Fundamentals via yfinance .info (cached 24h)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_YF_SUMMARY = "https://query1.finance.yahoo.com/v11/finance/quoteSummary/{ticker}"
+_YF_SUMMARY2 = "https://query2.finance.yahoo.com/v11/finance/quoteSummary/{ticker}"
+_YF_MODULES = "defaultKeyStatistics,summaryDetail,assetProfile,financialData"
+
+
+def _fetch_info(ticker: str) -> dict:
+    """Fetch P/E, sector, market cap etc. via Yahoo quoteSummary API, cached 24h."""
+    cached = _get_cached(ticker, "yf_info", OVERVIEW_CACHE_HOURS * 60)
     if cached:
         return cached
-
     try:
-        resp = requests.get(AV_BASE, params={
-            "function": "OVERVIEW",
-            "symbol": ticker,
-            "apikey": _get_api_key(),
-        }, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data or "Symbol" not in data:
-            return None
-
-        def _f(key):
-            v = data.get(key, "None")
+        params = {"modules": _YF_MODULES, "formatted": "false"}
+        data = None
+        for url_tpl in (_YF_SUMMARY, _YF_SUMMARY2):
             try:
-                return float(v) if v and v != "None" else None
-            except (ValueError, TypeError):
-                return None
+                resp = get_session().get(
+                    url_tpl.format(ticker=ticker), params=params, timeout=12
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("quoteSummary", {}).get("result") or []
+                    if data:
+                        data = data[0]
+                        break
+            except Exception:
+                continue
+
+        if not data:
+            return {}
+
+        ks  = data.get("defaultKeyStatistics", {})
+        sd  = data.get("summaryDetail", {})
+        ap  = data.get("assetProfile", {})
+        fd  = data.get("financialData", {})
+
+        def _v(d, key):
+            val = d.get(key)
+            if isinstance(val, dict):
+                val = val.get("raw")
+            return _safe_float(val)
 
         result = {
-            "name":            data.get("Name", ticker),
-            "sector":          data.get("Sector", ""),
-            "industry":        data.get("Industry", ""),
-            "market_cap":      _f("MarketCapitalization") or 0,
-            "pe_ratio":        _f("PERatio"),
-            "pb_ratio":        _f("PriceToBookRatio"),
-            "eps":             _f("EPS"),
-            "dividend_yield":  (_f("DividendYield") or 0) * 100,
-            "week_52_high":    _f("52WeekHigh") or 0,
-            "week_52_low":     _f("52WeekLow") or 0,
-            "ma_50":           _f("50DayMovingAverage"),
-            "ma_200":          _f("200DayMovingAverage"),
-            "revenue_growth":  _f("QuarterlyRevenueGrowthYOY"),
-            "earnings_growth": _f("QuarterlyEarningsGrowthYOY"),
-            "avg_volume":      int(_f("10DayAverageTradingVolume") or 0) * 1000,
+            "name":            ap.get("longBusinessSummary", ticker)[:40] if ap.get("longBusinessSummary") else ticker,
+            "sector":          ap.get("sector") or "",
+            "industry":        ap.get("industry") or "",
+            "market_cap":      _v(sd, "marketCap") or 0.0,
+            "pe_ratio":        _v(sd, "trailingPE"),
+            "pb_ratio":        _v(ks, "priceToBook"),
+            "eps":             _v(ks, "trailingEps"),
+            "dividend_yield":  (_v(sd, "dividendYield") or 0.0) * 100,
+            "week_52_high":    _v(sd, "fiftyTwoWeekHigh") or 0.0,
+            "week_52_low":     _v(sd, "fiftyTwoWeekLow") or 0.0,
+            "ma_50":           _v(sd, "fiftyDayAverage"),
+            "ma_200":          _v(sd, "twoHundredDayAverage"),
+            "avg_volume":      int(_v(sd, "averageVolume") or 0),
+            "revenue_growth":  _v(fd, "revenueGrowth"),
+            "earnings_growth": _v(fd, "earningsGrowth"),
         }
-        _set_cache(ticker, "overview", result)
+        if result["sector"] or result["pe_ratio"]:
+            _set_cache(ticker, "yf_info", result)
         return result
-
     except Exception:
-        return None
+        return {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main quote function
+# Quote builder
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_quote(ticker: str, q: dict, info: dict) -> StockQuote:
+    price   = q.get("price", 0.0)
+    avg_vol = info.get("avg_volume") or 0
+    w52_low = info.get("week_52_low") or 0.0
+    vs_low  = ((price - w52_low) / w52_low * 100) if w52_low > 0 else 0.0
+    ma50    = info.get("ma_50")
+    ma200   = info.get("ma_200")
+    div     = info.get("dividend_yield") or 0.0
+    vol     = q.get("volume", 0)
+
+    return StockQuote(
+        ticker=ticker,
+        name=info.get("name") or ticker,
+        price=price,
+        change=q.get("change", 0.0),
+        change_pct=q.get("change_pct", 0.0),
+        volume=vol,
+        avg_volume=avg_vol,
+        volume_ratio=(vol / avg_vol) if avg_vol > 0 else 0.0,
+        market_cap=info.get("market_cap") or 0.0,
+        pe_ratio=info.get("pe_ratio"),
+        pb_ratio=info.get("pb_ratio"),
+        eps=info.get("eps"),
+        dividend_yield=div if div > 0 else None,
+        sector=info.get("sector") or "",
+        industry=info.get("industry") or "",
+        week_52_high=info.get("week_52_high") or 0.0,
+        week_52_low=w52_low,
+        price_vs_52w_low_pct=vs_low,
+        ma_50=ma50,
+        ma_200=ma200,
+        above_50ma=(price > ma50) if ma50 else False,
+        above_200ma=(price > ma200) if ma200 else False,
+        change_1w=q.get("change_1w", 0.0),
+        revenue_growth=info.get("revenue_growth"),
+        earnings_growth=info.get("earnings_growth"),
+        asset_type="stock",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_quote(ticker: str) -> StockQuote:
-    """
-    Fetch a complete quote for one ticker using Alpha Vantage.
-
-    Makes up to 2 API calls per ticker (quote + overview), but uses
-    SQLite cache aggressively to stay within the 25 requests/day free limit.
-
-    Cache strategy:
-    - Price/volume: cached 15 minutes (fresh enough for trading decisions)
-    - Fundamentals: cached 24 hours (P/E doesn't change minute to minute)
-    """
+    """Full quote for a single ticker."""
     ticker = ticker.upper().strip()
-
     try:
-        # Always get quote (cached 15 min)
-        q = _fetch_global_quote(ticker)
-        if not q:
-            return StockQuote(ticker=ticker, error=f"No data found for {ticker} — check the ticker symbol")
-
-        price = q["price"]
-        prev_close = q["prev_close"]
-        change = q["change"]
-        change_pct = q["change_pct"]
-        volume = q["volume"]
-
-        # Get fundamentals (cached 24h) — best effort, not required
-        ov = _fetch_overview(ticker) or {}
-
-        avg_volume = ov.get("avg_volume") or 0
-        volume_ratio = (volume / avg_volume) if avg_volume > 0 else 0.0
-
-        week_52_high = ov.get("week_52_high") or 0.0
-        week_52_low  = ov.get("week_52_low") or 0.0
-        vs_low = ((price - week_52_low) / week_52_low * 100) if week_52_low > 0 else 0.0
-
-        ma50  = ov.get("ma_50")
-        ma200 = ov.get("ma_200")
-
-        div_yield = ov.get("dividend_yield") or 0
-        rev_growth = ov.get("revenue_growth")
-        earn_growth = ov.get("earnings_growth")
-
-        # Calculate 1-week change from cached history
-        change_1w = _get_weekly_change_cached(ticker)
-
-        return StockQuote(
-            ticker=ticker,
-            name=ov.get("name") or ticker,
-            price=price,
-            change=change,
-            change_pct=change_pct,
-            volume=volume,
-            avg_volume=avg_volume,
-            volume_ratio=volume_ratio,
-            market_cap=ov.get("market_cap") or 0,
-            pe_ratio=ov.get("pe_ratio"),
-            pb_ratio=ov.get("pb_ratio"),
-            eps=ov.get("eps"),
-            dividend_yield=div_yield if div_yield > 0 else None,
-            sector=ov.get("sector") or "",
-            industry=ov.get("industry") or "",
-            week_52_high=week_52_high,
-            week_52_low=week_52_low,
-            price_vs_52w_low_pct=vs_low,
-            ma_50=ma50,
-            ma_200=ma200,
-            above_50ma=(price > ma50) if ma50 else False,
-            above_200ma=(price > ma200) if ma200 else False,
-            change_1w=change_1w,
-            revenue_growth=rev_growth,
-            earnings_growth=earn_growth,
-            asset_type="stock",
-        )
-
-    except RuntimeError as e:
-        return StockQuote(ticker=ticker, error=str(e))
+        q_data = _fetch_quote_from_chart(ticker)
+        if not q_data or q_data["price"] == 0:
+            return StockQuote(ticker=ticker, error=f"No price data for {ticker}")
+        info = _fetch_info(ticker)
+        return _build_quote(ticker, q_data, info)
     except Exception as e:
         return StockQuote(ticker=ticker, error=str(e))
 
 
-def _get_weekly_change_cached(ticker: str) -> float:
-    """Get 1-week price change using cached daily history."""
-    try:
-        hist = get_history(ticker, outputsize="compact")
-        if not hist.empty and len(hist) >= 6:
-            start = hist["Close"].iloc[-6]
-            end   = hist["Close"].iloc[-1]
-            return ((end - start) / start * 100) if start else 0.0
-    except Exception:
-        pass
-    return 0.0
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Batch fetch
-# ──────────────────────────────────────────────────────────────────────────────
-
 def get_quotes_batch(
     tickers: list[str],
-    max_workers: int = 5,
+    max_workers: int = 10,
     progress_callback=None,
+    with_fundamentals: bool = False,
 ) -> dict[str, StockQuote]:
     """
-    Fetch quotes for many tickers.
-
-    Note: max_workers is kept low (5) to avoid hitting Alpha Vantage rate
-    limits. Cached results don't count against the limit.
+    Fetch quotes for many tickers in parallel via Yahoo chart API.
+    with_fundamentals=True also fetches P/E, P/B, sector (for screener).
     """
-    results: dict[str, StockQuote] = {}
-    done = 0
+    tickers = [t.upper() for t in tickers]
+    if not tickers:
+        return {}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_to_ticker = {pool.submit(get_quote, t): t for t in tickers}
-        for future in as_completed(future_to_ticker):
-            t = future_to_ticker[future]
-            try:
-                results[t] = future.result()
-            except Exception as exc:
-                results[t] = StockQuote(ticker=t, error=str(exc))
-            done += 1
-            if progress_callback:
-                progress_callback(done, len(tickers))
-            # Small delay between requests to be respectful of rate limits
-            time.sleep(0.2)
+    results: dict[str, StockQuote] = {}
+    stale: list[str] = []
+
+    for t in tickers:
+        cached_q = _get_cached(t, "yf_quote", QUOTE_CACHE_MINUTES)
+        if cached_q:
+            cached_i = _get_cached(t, "yf_info", OVERVIEW_CACHE_HOURS * 60) or {}
+            results[t] = _build_quote(t, cached_q, cached_i)
+        else:
+            stale.append(t)
+
+    if stale:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_quote_from_chart, t): t for t in stale}
+            for future in as_completed(futures):
+                t = futures[future]
+                try:
+                    q_data = future.result()
+                    if q_data and q_data["price"] > 0:
+                        info = _get_cached(t, "yf_info", OVERVIEW_CACHE_HOURS * 60) or {}
+                        results[t] = _build_quote(t, q_data, info)
+                    else:
+                        results[t] = StockQuote(ticker=t, error="No price data")
+                except Exception as exc:
+                    results[t] = StockQuote(ticker=t, error=str(exc))
+                if progress_callback:
+                    progress_callback(len(results), len(tickers))
+
+    if with_fundamentals:
+        needs_info = [t for t in tickers
+                      if t in results and not results[t].error and not results[t].sector]
+        if needs_info:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_fetch_info, t): t for t in needs_info}
+                for future in as_completed(futures):
+                    t = futures[future]
+                    try:
+                        info = future.result()
+                        q = results.get(t)
+                        if q and info and not q.error:
+                            q_data = {
+                                "price": q.price, "change": q.change,
+                                "change_pct": q.change_pct, "volume": q.volume,
+                                "change_1w": q.change_1w,
+                            }
+                            results[t] = _build_quote(t, q_data, info)
+                    except Exception:
+                        pass
 
     return results
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Historical data for charts
-# ──────────────────────────────────────────────────────────────────────────────
 
 def get_history(
     ticker: str,
@@ -380,75 +397,61 @@ def get_history(
     outputsize: str = "full",
     interval: str = "1d",
 ) -> pd.DataFrame:
-    """
-    Get daily OHLCV price history from Alpha Vantage TIME_SERIES_DAILY.
-    Cached for 24 hours to save API requests.
-
-    Args:
-        ticker: Stock symbol
-        period: Not used directly (Alpha Vantage returns full/compact history)
-        outputsize: "compact" = last 100 days, "full" = up to 20 years
-    """
-    cache_key = f"history_{outputsize}"
-    cached = _get_cached(ticker, cache_key, HISTORY_CACHE_HOURS * 60)
+    """OHLCV price history via Yahoo chart API, cached 60 minutes."""
+    cache_key = f"yf_hist_{period}_{interval}"
+    cached = _get_cached(ticker, cache_key, HISTORY_CACHE_MINUTES)
     if cached:
         try:
             df = pd.DataFrame(cached["data"])
             df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            return _filter_by_period(df, period)
+            return df.sort_index()
         except Exception:
             pass
 
-    try:
-        resp = requests.get(AV_BASE, params={
-            "function":   "TIME_SERIES_DAILY",
-            "symbol":     ticker.upper(),
-            "outputsize": outputsize,
-            "apikey":     _get_api_key(),
-        }, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+    # Map period string to Yahoo Finance range parameter
+    range_map = {
+        "1d": "1d", "5d": "5d", "1mo": "1mo", "3mo": "3mo",
+        "6mo": "6mo", "1y": "1y", "2y": "2y", "5y": "5y", "10d": "5d",
+    }
+    yf_range = range_map.get(period, "1y")
 
-        ts = data.get("Time Series (Daily)", {})
-        if not ts:
-            return pd.DataFrame()
+    result = _fetch_chart(ticker, range_=yf_range, interval=interval)
+    if not result:
+        return pd.DataFrame()
+
+    try:
+        timestamps = result.get("timestamp", [])
+        indicators = result.get("indicators", {}).get("quote", [{}])[0]
+        opens   = indicators.get("open", [])
+        highs   = indicators.get("high", [])
+        lows    = indicators.get("low", [])
+        closes  = indicators.get("close", [])
+        volumes = indicators.get("volume", [])
 
         rows = []
-        for date_str, vals in ts.items():
+        for i, ts in enumerate(timestamps):
+            c = closes[i] if i < len(closes) else None
+            if c is None:
+                continue
             rows.append({
-                "Date":   date_str,
-                "Open":   float(vals["1. open"]),
-                "High":   float(vals["2. high"]),
-                "Low":    float(vals["3. low"]),
-                "Close":  float(vals["4. close"]),
-                "Volume": int(vals["5. volume"]),
+                "Date":   pd.Timestamp(ts, unit="s"),
+                "Open":   opens[i]   if i < len(opens)   else c,
+                "High":   highs[i]   if i < len(highs)   else c,
+                "Low":    lows[i]    if i < len(lows)    else c,
+                "Close":  c,
+                "Volume": volumes[i] if i < len(volumes) else 0,
             })
 
+        if not rows:
+            return pd.DataFrame()
+
         df = pd.DataFrame(rows).set_index("Date")
-        df.index = pd.to_datetime(df.index)
         df = df.sort_index()
-
-        # Cache the raw data
         _set_cache(ticker, cache_key, {"data": df.to_dict()})
-
-        return _filter_by_period(df, period)
+        return df
 
     except Exception:
         return pd.DataFrame()
-
-
-def _filter_by_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    """Filter a DataFrame to a given period string like '1y', '6mo', '3mo'."""
-    if df.empty:
-        return df
-    period_map = {
-        "1d": 1, "5d": 5, "1mo": 30, "3mo": 90,
-        "6mo": 180, "1y": 365, "2y": 730, "5y": 1825,
-    }
-    days = period_map.get(period, 365)
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-    return df[df.index >= cutoff]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -456,23 +459,17 @@ def _filter_by_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_sp500_tickers() -> list[str]:
-    """
-    Fetch S&P 500 tickers from Wikipedia.
-    Falls back to hardcoded top-100 if unavailable.
-    """
     try:
         tables = pd.read_html(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             attrs={"id": "constituents"},
         )
-        df = tables[0]
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
         return [t for t in tickers if isinstance(t, str)]
     except Exception:
         return list(TOP_100_SP500)
 
 
-# Curated top-100 S&P 500 by approximate market cap (2024).
 TOP_100_SP500: tuple[str, ...] = (
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "BRK-B", "TSLA", "LLY",
     "AVGO", "JPM", "V", "UNH", "XOM", "MA", "JNJ", "PG", "HD", "COST",

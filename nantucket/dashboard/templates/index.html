@@ -44,6 +44,28 @@
   <div class="movers-grid" id="movers-grid"></div>
 </section>
 
+<!-- Sector Mini-Heatmap -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Sector Performance</h2>
+    <a href="/market" class="section-hint">Full market view →</a>
+  </div>
+  <div id="sector-mini-grid" class="sector-grid-mini">
+    <div class="loading-state">Loading sectors...</div>
+  </div>
+</section>
+
+<!-- News Feed -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Latest News</h2>
+    <a href="/market" class="section-hint">View all →</a>
+  </div>
+  <div id="news-feed-mini" class="news-feed">
+    <div class="loading-state">Loading news...</div>
+  </div>
+</section>
+
 <!-- Log a Trade -->
 <section class="section">
   <div class="section-header">
@@ -61,8 +83,8 @@
         <input type="number" id="trade-qty" placeholder="e.g. 10" min="0.0001" step="any" class="form-input" />
       </div>
       <div class="form-group">
-        <label>Price (leave blank for current)</label>
-        <input type="number" id="trade-price" placeholder="Market price" step="0.01" class="form-input" />
+        <label>Price per share <span class="text-down">*</span></label>
+        <input type="number" id="trade-price" placeholder="e.g. 185.00" step="0.01" min="0.0001" class="form-input" required />
       </div>
       <div class="form-group form-group-btns">
         <label>&nbsp;</label>
@@ -91,33 +113,108 @@ async function loadOverview() {
   document.getElementById('last-updated').textContent =
     'Updated ' + new Date().toLocaleTimeString();
 
-  // Portfolio stats
+  // ── Phase 1: instant data straight from DB ─────────────────────────────────
+
+  // Watchlist tickers (no price fetch — just shows tickers immediately)
   try {
-    const port = await fetchJSON('/api/portfolio');
-    document.getElementById('total-value').textContent =
-      port.total_value > 0 ? formatCurrency(port.total_value) : '$0.00';
-    document.getElementById('total-pnl').innerHTML =
-      port.total_value > 0 ? coloredChange(port.total_pnl, true) : '$0.00';
-    document.getElementById('total-return').innerHTML =
-      port.total_value > 0 ? coloredChangePct(port.total_pnl_pct) : '0.00%';
-    document.getElementById('position-count').textContent = port.positions.length;
+    const tickers = await fetchJSON('/api/watchlist/tickers');
+    if (tickers.length > 0) {
+      renderWatchlist(tickers.map(e => ({
+        ticker: e.ticker, asset_type: e.asset_type,
+        name: e.ticker, price: null, change: 0, change_pct: 0,
+      })));
+    }
   } catch(e) {}
 
-  // Watchlist
+  // Portfolio positions (at cost, no live prices)
   try {
-    const wl = await fetchJSON('/api/watchlist');
-    renderWatchlist(wl);
-    renderMovers(wl);
-  } catch(e) {
-    document.getElementById('watchlist-container').innerHTML =
-      '<div class="empty-state">Error loading watchlist</div>';
-  }
+    const port = await fetchJSON('/api/portfolio/raw');
+    document.getElementById('position-count').textContent = port.positions.length;
+    if (port.total_value > 0) {
+      document.getElementById('total-value').textContent = formatCurrency(port.total_value);
+    }
+  } catch(e) {}
 
-  // Recent trades
+  // Trades are instant DB reads
   try {
     const trades = await fetchJSON('/api/trades');
     renderTrades(trades);
   } catch(e) {}
+
+  // ── Phase 2: live prices (slower, updates after page is already showing) ───
+
+  Promise.allSettled([
+    fetchJSON('/api/watchlist'),
+    fetchJSON('/api/portfolio'),
+    fetchJSON('/api/sectors'),
+    fetchJSON('/api/news?limit=5'),
+  ]).then(([wlRes, portRes, sectRes, newsRes]) => {
+    // Live watchlist prices
+    if (wlRes.status === 'fulfilled') {
+      renderWatchlist(wlRes.value);
+      renderMovers(wlRes.value);
+    }
+    // Live portfolio P&L
+    if (portRes.status === 'fulfilled') {
+      const port = portRes.value;
+      document.getElementById('total-value').textContent =
+        port.total_value > 0 ? formatCurrency(port.total_value) : '$0.00';
+      document.getElementById('total-pnl').innerHTML =
+        port.total_value > 0 ? coloredChange(port.total_pnl, true) : '$0.00';
+      document.getElementById('total-return').innerHTML =
+        port.total_value > 0 ? coloredChangePct(port.total_pnl_pct) : '0.00%';
+      document.getElementById('position-count').textContent = port.positions.length;
+    }
+    // Sector heatmap
+    if (sectRes.status === 'fulfilled') renderSectorMini(sectRes.value.sectors);
+    // News
+    if (newsRes.status === 'fulfilled') renderNewsMini(newsRes.value);
+  });
+}
+
+function renderSectorMini(sectors) {
+  const container = document.getElementById('sector-mini-grid');
+  if (!sectors || !sectors.length) {
+    container.innerHTML = '<div class="dim small">No sector data.</div>';
+    return;
+  }
+  let html = '';
+  for (const s of sectors) {
+    const val = s.change_1d || 0;
+    const pct = Math.min(Math.abs(val) / 5, 1);
+    const bg = val >= 0
+      ? `rgba(34,197,94,${0.1 + pct * 0.4})`
+      : `rgba(239,68,68,${0.1 + pct * 0.4})`;
+    const textColor = val >= 0 ? '#22c55e' : '#ef4444';
+    html += `<a href="/stock/${s.ticker}" class="sector-cell" style="background:${bg}">
+      <div class="sector-name">${s.name}</div>
+      <div class="sector-change" style="color:${textColor};font-size:13px">${val >= 0 ? '+' : ''}${val.toFixed(2)}%</div>
+    </a>`;
+  }
+  container.innerHTML = html;
+}
+
+function renderNewsMini(feed) {
+  const container = document.getElementById('news-feed-mini');
+  if (feed.error) {
+    container.innerHTML = `<div class="dim small" style="padding:12px">${feed.error}</div>`;
+    return;
+  }
+  if (!feed.items || !feed.items.length) {
+    container.innerHTML = '<div class="dim small" style="padding:12px">No headlines matched your watchlist.</div>';
+    return;
+  }
+  let html = '<ul class="news-list">';
+  for (const item of feed.items) {
+    const label = item.ticker || 'MKT';
+    html += `<li class="news-item">
+      <span class="badge badge-stock">${label}</span>
+      <a href="${item.url}" target="_blank" rel="noopener" class="news-headline">${item.headline}</a>
+      <span class="news-meta dim small">${item.source}</span>
+    </li>`;
+  }
+  html += '</ul>';
+  container.innerHTML = html;
 }
 
 function renderWatchlist(quotes) {
@@ -134,13 +231,13 @@ function renderWatchlist(quotes) {
   const rows = quotes.map(q => `
     <tr class="${q.error ? 'row-error' : ''}">
       <td><a href="/stock/${q.ticker}" class="ticker-link">${q.ticker}</a></td>
-      <td class="dim">${truncate(q.name, 26)}</td>
-      <td class="num">${q.error ? '—' : formatCurrency(q.price)}</td>
-      <td class="num">${q.error ? '—' : coloredChangePct(q.change_pct)}</td>
-      <td class="num">${q.error ? '—' : coloredChangePct(q.change_1w)}</td>
+      <td class="dim">${truncate(q.name || q.ticker, 26)}</td>
+      <td class="num">${q.price == null ? '<span class="dim small">loading…</span>' : (q.price > 0 ? formatCurrency(q.price) : '—')}</td>
+      <td class="num">${q.price == null ? '—' : coloredChangePct(q.change_pct)}</td>
+      <td class="num">${q.price == null ? '—' : coloredChangePct(q.change_1w)}</td>
       <td class="num dim">${q.volume ? formatVolume(q.volume) : '—'}</td>
       <td class="num dim">${q.pe_ratio ? q.pe_ratio + 'x' : '—'}</td>
-      <td><span class="badge badge-${q.asset_type}">${q.asset_type}</span></td>
+      <td><span class="badge badge-${q.asset_type || 'stock'}">${q.asset_type || 'stock'}</span></td>
       <td>
         <button class="remove-btn" onclick="removeTicker('${q.ticker}')" title="Remove">✕</button>
       </td>
@@ -241,14 +338,15 @@ async function logTrade(action) {
   const price  = document.getElementById('trade-price').value;
   const msgEl  = document.getElementById('trade-message');
 
+  const priceVal = parseFloat(document.getElementById('trade-price').value);
   if (!ticker) { showTradeMsg('Enter a ticker symbol', 'error'); return; }
   if (!qty || qty <= 0) { showTradeMsg('Enter a valid quantity', 'error'); return; }
+  if (!priceVal || priceVal <= 0) { showTradeMsg('Enter the price per share', 'error'); return; }
 
   showTradeMsg(`Logging ${action.toUpperCase()} ${qty} × ${ticker}...`, 'info');
 
   try {
-    const body = {ticker, quantity: qty, asset_type: 'stock'};
-    if (price) body.price = parseFloat(price);
+    const body = {ticker, quantity: qty, price: priceVal, asset_type: 'stock'};
 
     const res = await fetch(`/api/trade/${action}`, {
       method: 'POST',

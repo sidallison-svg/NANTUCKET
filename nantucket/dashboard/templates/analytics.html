@@ -1,0 +1,266 @@
+{% extends "base.html" %}
+{% block title %}Analytics — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1 class="page-title">Portfolio Analytics</h1>
+  <span class="page-subtitle dim" id="analytics-updated">Loading...</span>
+</div>
+
+<!-- Risk Metrics Cards -->
+<div class="stats-row" id="analytics-stats">
+  <div class="stat-card">
+    <div class="stat-label">Total Return</div>
+    <div class="stat-value" id="stat-return">—</div>
+    <div class="stat-sub dim" id="stat-period">1 year</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Sharpe Ratio</div>
+    <div class="stat-value" id="stat-sharpe">—</div>
+    <div class="stat-sub dim">Risk-adj return</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Sortino Ratio</div>
+    <div class="stat-value" id="stat-sortino">—</div>
+    <div class="stat-sub dim">Downside-adj</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Max Drawdown</div>
+    <div class="stat-value" id="stat-maxdd">—</div>
+    <div class="stat-sub dim" id="stat-maxdd-dates">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Beta vs SPY</div>
+    <div class="stat-value" id="stat-beta">—</div>
+    <div class="stat-sub dim">Market sensitivity</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Ann. Volatility</div>
+    <div class="stat-value" id="stat-vol">—</div>
+    <div class="stat-sub dim">Annualised std dev</div>
+  </div>
+</div>
+
+<!-- Correlation Matrix -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Correlation Matrix</h2>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="corr-source" class="form-input" style="width:130px" onchange="loadCorrelation()">
+        <option value="watchlist">Watchlist</option>
+        <option value="portfolio">Portfolio</option>
+      </select>
+      <select id="corr-period" class="form-input" style="width:80px" onchange="loadCorrelation()">
+        <option value="1y">1 Year</option>
+        <option value="6mo">6 Month</option>
+        <option value="2y">2 Year</option>
+      </select>
+    </div>
+  </div>
+  <div id="corr-container"><div class="loading-state">Loading correlation matrix...</div></div>
+</section>
+
+<!-- Technical Summary across watchlist -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Technical Signals (Watchlist)</h2>
+    <span class="dim small">RSI · MACD · Bollinger Bands</span>
+  </div>
+  <div id="tech-summary-container"><div class="loading-state">Loading technical signals...</div></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadAnalytics() {
+  document.getElementById('analytics-updated').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+  try {
+    const data = await fetchJSON('/api/analytics');
+    renderAnalyticsCards(data);
+  } catch(e) {
+    document.getElementById('analytics-updated').textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderAnalyticsCards(d) {
+  function fmtSigned(val, suffix) {
+    if (val === null || val === undefined) return '—';
+    const sign = val >= 0 ? '+' : '';
+    return sign + val.toFixed(2) + (suffix || '');
+  }
+  function colorClass(val) {
+    if (val === null || val === undefined) return '';
+    return val >= 0 ? 'text-up' : 'text-down';
+  }
+
+  const ret = d.total_return;
+  const retEl = document.getElementById('stat-return');
+  retEl.textContent = ret !== null ? (ret >= 0 ? '+' : '') + ret.toFixed(2) + '%' : '—';
+  retEl.className = 'stat-value ' + colorClass(ret);
+
+  const sharpe = d.sharpe_ratio;
+  const sharpeEl = document.getElementById('stat-sharpe');
+  sharpeEl.textContent = sharpe !== null ? sharpe.toFixed(3) : '—';
+  sharpeEl.className = 'stat-value ' + colorClass(sharpe);
+
+  const sortino = d.sortino_ratio;
+  const sortinoEl = document.getElementById('stat-sortino');
+  sortinoEl.textContent = sortino !== null ? sortino.toFixed(3) : '—';
+  sortinoEl.className = 'stat-value ' + colorClass(sortino);
+
+  const dd = d.max_drawdown;
+  const ddEl = document.getElementById('stat-maxdd');
+  ddEl.textContent = dd !== undefined ? dd.toFixed(2) + '%' : '—';
+  ddEl.className = 'stat-value text-down';
+  if (d.max_drawdown_start) {
+    document.getElementById('stat-maxdd-dates').textContent =
+      d.max_drawdown_start + ' → ' + d.max_drawdown_end;
+  }
+
+  const beta = d.beta_vs_spy;
+  document.getElementById('stat-beta').textContent = beta !== null ? beta.toFixed(3) : '—';
+
+  document.getElementById('stat-vol').textContent =
+    d.volatility_annualized !== undefined ? d.volatility_annualized.toFixed(2) + '%' : '—';
+
+  document.getElementById('stat-period').textContent = d.period || '1 year';
+
+  if (d.error) {
+    document.getElementById('analytics-updated').textContent += '  (' + d.error + ')';
+  }
+}
+
+// ── Correlation Matrix ───────────────────────────────────────────────────────
+async function loadCorrelation() {
+  const source = document.getElementById('corr-source').value;
+  const period = document.getElementById('corr-period').value;
+  const container = document.getElementById('corr-container');
+  container.innerHTML = '<div class="loading-state">Computing correlations...</div>';
+
+  try {
+    let tickers = [];
+    if (source === 'watchlist') {
+      const wl = await fetchJSON('/api/watchlist');
+      tickers = wl.map(q => q.ticker).filter(t => !t.includes('='));  // exclude futures
+    } else {
+      const port = await fetchJSON('/api/portfolio');
+      tickers = port.positions.map(p => p.ticker);
+    }
+    if (tickers.length < 2) {
+      container.innerHTML = '<div class="empty-state">Need at least 2 tickers for a correlation matrix.</div>';
+      return;
+    }
+    const data = await fetchJSON(`/api/correlation?tickers=${tickers.join(',')}&period=${period}`);
+    renderCorrMatrix(data);
+  } catch(e) {
+    container.innerHTML = '<div class="error-state">Error: ' + e.message + '</div>';
+  }
+}
+
+function renderCorrMatrix(data) {
+  const container = document.getElementById('corr-container');
+  if (data.error && !data.tickers.length) {
+    container.innerHTML = '<div class="empty-state dim">' + data.error + '</div>';
+    return;
+  }
+  const tickers = data.tickers;
+  let html = '<div style="overflow-x:auto"><table class="corr-table"><thead><tr><th></th>';
+  tickers.forEach(t => { html += `<th>${t}</th>`; });
+  html += '</tr></thead><tbody>';
+
+  data.matrix.forEach((row, i) => {
+    html += `<tr><th>${tickers[i]}</th>`;
+    row.forEach((val, j) => {
+      if (i === j) {
+        html += `<td class="corr-diagonal">1.00</td>`;
+      } else {
+        const pct = Math.abs(val);
+        const bg = val >= 0
+          ? `rgba(34,197,94,${0.1 + pct * 0.5})`
+          : `rgba(239,68,68,${0.1 + pct * 0.5})`;
+        const color = val >= 0 ? '#22c55e' : '#ef4444';
+        html += `<td style="background:${bg};color:${color}">${val.toFixed(2)}</td>`;
+      }
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  if (data.dates_range) {
+    html += `<div class="dim small" style="margin-top:6px">${data.dates_range}</div>`;
+  }
+  if (data.excluded && data.excluded.length) {
+    html += `<div class="dim small">Excluded (insufficient data): ${data.excluded.join(', ')}</div>`;
+  }
+  container.innerHTML = html;
+}
+
+// ── Technical Summary ────────────────────────────────────────────────────────
+async function loadTechSummary() {
+  const container = document.getElementById('tech-summary-container');
+  try {
+    const wl = await fetchJSON('/api/watchlist');
+    const stockTickers = wl
+      .filter(q => q.asset_type === 'stock' || q.asset_type === 'etf')
+      .map(q => q.ticker)
+      .slice(0, 15);  // cap at 15 to avoid too many requests
+
+    if (!stockTickers.length) {
+      container.innerHTML = '<div class="empty-state">No stocks/ETFs in watchlist.</div>';
+      return;
+    }
+
+    container.innerHTML = '<div class="loading-state">Fetching indicators for ' + stockTickers.length + ' tickers...</div>';
+
+    const results = await Promise.allSettled(
+      stockTickers.map(t => fetchJSON(`/api/stock/${t}/indicators?period=6mo`))
+    );
+
+    let html = `<table class="data-table"><thead><tr>
+      <th>Ticker</th>
+      <th class="num">RSI (14)</th><th>RSI Signal</th>
+      <th class="num">MACD</th><th>MACD Signal</th>
+      <th class="num">BB %B</th><th>BB Signal</th>
+    </tr></thead><tbody>`;
+
+    stockTickers.forEach((ticker, idx) => {
+      const res = results[idx];
+      if (res.status !== 'fulfilled' || res.value.error) {
+        html += `<tr><td><a href="/stock/${ticker}" class="ticker-link">${ticker}</a></td>
+          <td colspan="6" class="dim">No data</td></tr>`;
+        return;
+      }
+      const d = res.value;
+      const rsi = d.rsi, macd = d.macd, bb = d.bollinger;
+
+      const rsiVal = rsi ? rsi.current.toFixed(1) : '—';
+      const rsiColor = rsi ? (rsi.overbought ? 'text-down' : rsi.oversold ? 'text-up' : '') : '';
+      const rsiSig = rsi ? (rsi.overbought ? 'Overbought' : rsi.oversold ? 'Oversold' : 'Neutral') : '—';
+
+      const macdVal = macd ? macd.current_macd.toFixed(3) : '—';
+      const macdColor = macd ? (macd.current_macd >= 0 ? 'text-up' : 'text-down') : '';
+      const macdSig = macd ? (macd.bullish_crossover ? 'Crossover' : macd.current_macd > macd.current_signal ? 'Bullish' : 'Bearish') : '—';
+
+      const bbVal = bb ? bb.pct_b.toFixed(2) : '—';
+      const bbColor = bb ? (bb.pct_b > 1 ? 'text-down' : bb.pct_b < 0 ? 'text-up' : '') : '';
+      const bbSig = bb ? (bb.pct_b > 1 ? 'Above band' : bb.pct_b < 0 ? 'Below band' : bb.squeeze ? 'Squeeze' : 'Normal') : '—';
+
+      html += `<tr>
+        <td><a href="/stock/${ticker}" class="ticker-link">${ticker}</a></td>
+        <td class="num ${rsiColor}">${rsiVal}</td><td class="${rsiColor}">${rsiSig}</td>
+        <td class="num ${macdColor}">${macdVal}</td><td class="${macdColor}">${macdSig}</td>
+        <td class="num ${bbColor}">${bbVal}</td><td class="${bbColor}">${bbSig}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="error-state">Error: ' + e.message + '</div>';
+  }
+}
+
+loadAnalytics();
+loadCorrelation();
+loadTechSummary();
+</script>
+{% endblock %}

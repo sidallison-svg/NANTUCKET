@@ -9,8 +9,11 @@ home directory. This means:
 - Easy to reset (just delete the file)
 """
 
+import json
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 from nantucket.db.models import ALL_TABLES
 
@@ -40,6 +43,37 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def get_econ_cached(key: str, max_age_minutes: int) -> Optional[dict]:
+    """Return cached econ/news data if it exists and is still fresh, else None."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT data_json, fetched_at FROM econ_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            age = datetime.now() - datetime.fromisoformat(row["fetched_at"])
+            if age > timedelta(minutes=max_age_minutes):
+                return None
+            return json.loads(row["data_json"])
+    except Exception:
+        return None
+
+
+def set_econ_cache(key: str, data: dict) -> None:
+    """Store data in the econ_cache table, replacing any existing entry."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO econ_cache (cache_key, data_json, fetched_at) VALUES (?, ?, ?)",
+                (key, json.dumps(data), datetime.now().isoformat()),
+            )
+            conn.commit()
+    except Exception:
+        pass
 
 
 def init_db() -> None:

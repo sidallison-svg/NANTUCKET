@@ -55,6 +55,61 @@
   </div>
 </section>
 
+<!-- Technical Indicators -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Technical Indicators</h2>
+    <div class="tab-row" id="indicator-period-btns">
+      <button class="tab-btn active" onclick="loadIndicators('6mo', this)">6M</button>
+      <button class="tab-btn" onclick="loadIndicators('1y', this)">1Y</button>
+    </div>
+  </div>
+  <div class="indicators-grid" id="indicators-cards" style="display:none">
+    <div class="stat-card">
+      <div class="stat-label">RSI (14)</div>
+      <div class="stat-value" id="ind-rsi-val">—</div>
+      <div class="stat-sub" id="ind-rsi-sig">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">MACD</div>
+      <div class="stat-value" id="ind-macd-val">—</div>
+      <div class="stat-sub" id="ind-macd-sig">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">BB %B</div>
+      <div class="stat-value" id="ind-bb-val">—</div>
+      <div class="stat-sub" id="ind-bb-sig">—</div>
+    </div>
+  </div>
+  <div class="chart-container" style="height:160px;margin-top:12px">
+    <canvas id="rsiChart"></canvas>
+  </div>
+  <div class="chart-container" style="height:160px;margin-top:10px">
+    <canvas id="macdChart"></canvas>
+  </div>
+  <div id="ind-error" class="error-state" style="display:none"></div>
+</section>
+
+<!-- Price Alerts -->
+<section class="section">
+  <div class="section-header">
+    <h2 class="section-title">Price Alerts</h2>
+    <button class="action-btn" onclick="toggleAlertForm()">+ Add Alert</button>
+  </div>
+  <div id="alert-form" style="display:none" class="inline-form">
+    <select id="alert-dir" class="form-input" style="min-width:90px">
+      <option value="above">Above</option>
+      <option value="below">Below</option>
+    </select>
+    <input type="number" id="alert-target" placeholder="Target price" class="form-input" step="0.01" style="width:140px"/>
+    <input type="text"   id="alert-note"   placeholder="Note (optional)" class="form-input" style="width:160px"/>
+    <button class="btn-primary" onclick="addAlert()">Save</button>
+    <button class="btn-ghost"   onclick="toggleAlertForm()">Cancel</button>
+    <span id="alert-msg" class="dim small" style="margin-left:8px"></span>
+  </div>
+  <div id="alerts-container"><div class="loading-state">Loading alerts...</div></div>
+</section>
+
 <!-- AI Analysis -->
 <section class="section">
   <div class="section-header">
@@ -248,5 +303,201 @@ function markdownToHtml(text) {
 }
 
 loadStockData();
+loadIndicators('6mo', null);
+loadAlerts();
+
+// ── Technical Indicators ────────────────────────────────────────────────────
+let rsiChart = null, macdChart = null;
+
+async function loadIndicators(period, btn) {
+  if (btn) {
+    document.querySelectorAll('#indicator-period-btns .tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  try {
+    const data = await fetchJSON(`/api/stock/${TICKER}/indicators?period=${period}`);
+    if (data.error && !data.rsi) {
+      document.getElementById('ind-error').textContent = data.error;
+      document.getElementById('ind-error').style.display = '';
+      return;
+    }
+    document.getElementById('ind-error').style.display = 'none';
+    document.getElementById('indicators-cards').style.display = '';
+
+    if (data.rsi) {
+      const rsi = data.rsi;
+      const rsiEl = document.getElementById('ind-rsi-val');
+      rsiEl.textContent = rsi.current.toFixed(1);
+      rsiEl.className = 'stat-value ' + (rsi.overbought ? 'text-down' : rsi.oversold ? 'text-up' : '');
+      document.getElementById('ind-rsi-sig').textContent =
+        rsi.overbought ? 'Overbought' : rsi.oversold ? 'Oversold' : 'Neutral';
+      renderRsiChart(rsi.dates, rsi.values);
+    }
+    if (data.macd) {
+      const m = data.macd;
+      const macdEl = document.getElementById('ind-macd-val');
+      macdEl.textContent = m.current_macd.toFixed(3);
+      macdEl.className = 'stat-value ' + (m.current_macd >= 0 ? 'text-up' : 'text-down');
+      document.getElementById('ind-macd-sig').textContent =
+        m.bullish_crossover ? 'Bullish crossover' : (m.current_macd > m.current_signal ? 'Bullish' : 'Bearish');
+      renderMacdChart(m.dates, m.macd_line, m.signal_line, m.histogram);
+    }
+    if (data.bollinger) {
+      const bb = data.bollinger;
+      const bbEl = document.getElementById('ind-bb-val');
+      bbEl.textContent = bb.pct_b.toFixed(2);
+      bbEl.className = 'stat-value ' + (bb.pct_b > 1 ? 'text-down' : bb.pct_b < 0 ? 'text-up' : '');
+      document.getElementById('ind-bb-sig').textContent =
+        bb.pct_b > 1 ? 'Above upper band' : bb.pct_b < 0 ? 'Below lower band' :
+        bb.squeeze ? 'Squeeze (low vol)' : `${(bb.pct_b * 100).toFixed(0)}% of band`;
+    }
+  } catch(e) {
+    document.getElementById('ind-error').textContent = 'Could not load indicators: ' + e.message;
+    document.getElementById('ind-error').style.display = '';
+  }
+}
+
+function renderRsiChart(dates, values) {
+  const ctx = document.getElementById('rsiChart').getContext('2d');
+  if (rsiChart) rsiChart.destroy();
+  rsiChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: dates,
+      datasets: [{
+        label: 'RSI (14)',
+        data: values,
+        borderColor: '#3b82f6',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+        annotation: { annotations: {
+          ob: { type:'line', yMin:70, yMax:70, borderColor:'rgba(239,68,68,0.4)', borderWidth:1, borderDash:[4,4] },
+          os: { type:'line', yMin:30, yMax:30, borderColor:'rgba(34,197,94,0.4)', borderWidth:1, borderDash:[4,4] },
+        }}
+      },
+      scales: {
+        x: { ticks: { color:'#94a3b8', maxTicksLimit:6 }, grid: { color:'rgba(148,163,184,0.06)' } },
+        y: { min:0, max:100, ticks: { color:'#94a3b8', callback: v => v }, grid: { color:'rgba(148,163,184,0.06)' } }
+      }
+    }
+  });
+}
+
+function renderMacdChart(dates, macdLine, signalLine, histogram) {
+  const ctx = document.getElementById('macdChart').getContext('2d');
+  if (macdChart) macdChart.destroy();
+  macdChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: dates,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'Histogram',
+          data: histogram,
+          backgroundColor: histogram.map(v => v >= 0 ? 'rgba(34,197,94,0.5)' : 'rgba(239,68,68,0.5)'),
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'MACD',
+          data: macdLine,
+          borderColor: '#3b82f6',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: false,
+          order: 1,
+        },
+        {
+          type: 'line',
+          label: 'Signal',
+          data: signalLine,
+          borderColor: '#f59e0b',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: false,
+          order: 1,
+        }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color:'#94a3b8', maxTicksLimit:6 }, grid: { color:'rgba(148,163,184,0.06)' } },
+        y: { ticks: { color:'#94a3b8' }, grid: { color:'rgba(148,163,184,0.06)' } }
+      }
+    }
+  });
+}
+
+// ── Price Alerts ────────────────────────────────────────────────────────────
+async function loadAlerts() {
+  try {
+    const data = await fetchJSON(`/api/alerts?ticker=${TICKER}`);
+    renderAlerts(data.alerts, data.recent_triggers);
+  } catch(e) {
+    document.getElementById('alerts-container').innerHTML =
+      '<div class="error-state">Could not load alerts.</div>';
+  }
+}
+
+function renderAlerts(alerts, triggers) {
+  const container = document.getElementById('alerts-container');
+  const all = [...alerts, ...triggers.filter(t => t.ticker === TICKER)];
+  if (!all.length) {
+    container.innerHTML = '<div class="empty-state">No alerts for ' + TICKER + '.</div>';
+    return;
+  }
+  let html = '<table class="data-table"><thead><tr><th>Direction</th><th>Target</th><th>Note</th><th>Status</th><th></th></tr></thead><tbody>';
+  for (const a of all) {
+    const color = a.direction === 'above' ? 'text-up' : 'text-down';
+    const status = a.active ? '<span class="text-up">active</span>' : '<span class="dim">triggered</span>';
+    html += `<tr>
+      <td class="${color}">${a.direction}</td>
+      <td class="num">$${a.target.toLocaleString('en-US', {minimumFractionDigits:2})}</td>
+      <td class="dim">${a.note || '—'}</td>
+      <td>${status}</td>
+      <td>${a.active ? `<button class="btn-ghost small" onclick="deleteAlert(${a.id})">✕</button>` : ''}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function toggleAlertForm() {
+  const f = document.getElementById('alert-form');
+  f.style.display = f.style.display === 'none' ? '' : 'none';
+}
+
+async function addAlert() {
+  const dir    = document.getElementById('alert-dir').value;
+  const target = parseFloat(document.getElementById('alert-target').value);
+  const note   = document.getElementById('alert-note').value;
+  const msg    = document.getElementById('alert-msg');
+  if (!target || isNaN(target)) { msg.textContent = 'Enter a valid price.'; return; }
+  try {
+    await fetchJSON('/api/alerts', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ticker: TICKER, direction: dir, target, note}),
+    });
+    msg.textContent = '';
+    toggleAlertForm();
+    loadAlerts();
+  } catch(e) { msg.textContent = 'Error: ' + e.message; }
+}
+
+async function deleteAlert(id) {
+  await fetch(`/api/alerts/${id}`, {method:'DELETE'});
+  loadAlerts();
+}
 </script>
 {% endblock %}
