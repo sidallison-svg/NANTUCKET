@@ -200,32 +200,64 @@ def _fetch_quote_from_chart(ticker: str) -> Optional[dict]:
 # Fundamentals via yfinance .info (cached 24h)
 # ──────────────────────────────────────────────────────────────────────────────
 
+_YF_SUMMARY = "https://query1.finance.yahoo.com/v11/finance/quoteSummary/{ticker}"
+_YF_SUMMARY2 = "https://query2.finance.yahoo.com/v11/finance/quoteSummary/{ticker}"
+_YF_MODULES = "defaultKeyStatistics,summaryDetail,assetProfile,financialData"
+
+
 def _fetch_info(ticker: str) -> dict:
-    """Fetch P/E, sector, market cap etc. via yfinance, cached 24h."""
+    """Fetch P/E, sector, market cap etc. via Yahoo quoteSummary API, cached 24h."""
     cached = _get_cached(ticker, "yf_info", OVERVIEW_CACHE_HOURS * 60)
     if cached:
         return cached
     try:
-        import yfinance as yf
-        info = yf.Ticker(ticker, session=get_session()).info or {}
+        params = {"modules": _YF_MODULES, "formatted": "false"}
+        data = None
+        for url_tpl in (_YF_SUMMARY, _YF_SUMMARY2):
+            try:
+                resp = get_session().get(
+                    url_tpl.format(ticker=ticker), params=params, timeout=12
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("quoteSummary", {}).get("result") or []
+                    if data:
+                        data = data[0]
+                        break
+            except Exception:
+                continue
+
+        if not data:
+            return {}
+
+        ks  = data.get("defaultKeyStatistics", {})
+        sd  = data.get("summaryDetail", {})
+        ap  = data.get("assetProfile", {})
+        fd  = data.get("financialData", {})
+
+        def _v(d, key):
+            val = d.get(key)
+            if isinstance(val, dict):
+                val = val.get("raw")
+            return _safe_float(val)
+
         result = {
-            "name":            info.get("longName") or info.get("shortName") or ticker,
-            "sector":          info.get("sector") or "",
-            "industry":        info.get("industry") or "",
-            "market_cap":      _safe_float(info.get("marketCap")) or 0.0,
-            "pe_ratio":        _safe_float(info.get("trailingPE")),
-            "pb_ratio":        _safe_float(info.get("priceToBook")),
-            "eps":             _safe_float(info.get("trailingEps")),
-            "dividend_yield":  (_safe_float(info.get("dividendYield")) or 0.0) * 100,
-            "week_52_high":    _safe_float(info.get("fiftyTwoWeekHigh")) or 0.0,
-            "week_52_low":     _safe_float(info.get("fiftyTwoWeekLow")) or 0.0,
-            "ma_50":           _safe_float(info.get("fiftyDayAverage")),
-            "ma_200":          _safe_float(info.get("twoHundredDayAverage")),
-            "avg_volume":      int(_safe_float(info.get("averageVolume")) or 0),
-            "revenue_growth":  _safe_float(info.get("revenueGrowth")),
-            "earnings_growth": _safe_float(info.get("earningsGrowth")),
+            "name":            ap.get("longBusinessSummary", ticker)[:40] if ap.get("longBusinessSummary") else ticker,
+            "sector":          ap.get("sector") or "",
+            "industry":        ap.get("industry") or "",
+            "market_cap":      _v(sd, "marketCap") or 0.0,
+            "pe_ratio":        _v(sd, "trailingPE"),
+            "pb_ratio":        _v(ks, "priceToBook"),
+            "eps":             _v(ks, "trailingEps"),
+            "dividend_yield":  (_v(sd, "dividendYield") or 0.0) * 100,
+            "week_52_high":    _v(sd, "fiftyTwoWeekHigh") or 0.0,
+            "week_52_low":     _v(sd, "fiftyTwoWeekLow") or 0.0,
+            "ma_50":           _v(sd, "fiftyDayAverage"),
+            "ma_200":          _v(sd, "twoHundredDayAverage"),
+            "avg_volume":      int(_v(sd, "averageVolume") or 0),
+            "revenue_growth":  _v(fd, "revenueGrowth"),
+            "earnings_growth": _v(fd, "earningsGrowth"),
         }
-        if result["name"] != ticker:  # only cache if we got real data
+        if result["sector"] or result["pe_ratio"]:
             _set_cache(ticker, "yf_info", result)
         return result
     except Exception:
