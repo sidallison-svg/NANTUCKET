@@ -113,45 +113,63 @@ async function loadOverview() {
   document.getElementById('last-updated').textContent =
     'Updated ' + new Date().toLocaleTimeString();
 
-  // Portfolio stats
+  // ── Phase 1: instant data straight from DB ─────────────────────────────────
+
+  // Watchlist tickers (no price fetch — just shows tickers immediately)
   try {
-    const port = await fetchJSON('/api/portfolio');
-    document.getElementById('total-value').textContent =
-      port.total_value > 0 ? formatCurrency(port.total_value) : '$0.00';
-    document.getElementById('total-pnl').innerHTML =
-      port.total_value > 0 ? coloredChange(port.total_pnl, true) : '$0.00';
-    document.getElementById('total-return').innerHTML =
-      port.total_value > 0 ? coloredChangePct(port.total_pnl_pct) : '0.00%';
-    document.getElementById('position-count').textContent = port.positions.length;
+    const tickers = await fetchJSON('/api/watchlist/tickers');
+    if (tickers.length > 0) {
+      renderWatchlist(tickers.map(e => ({
+        ticker: e.ticker, asset_type: e.asset_type,
+        name: e.ticker, price: null, change: 0, change_pct: 0,
+      })));
+    }
   } catch(e) {}
 
-  // Watchlist
+  // Portfolio positions (at cost, no live prices)
   try {
-    const wl = await fetchJSON('/api/watchlist');
-    renderWatchlist(wl);
-    renderMovers(wl);
-  } catch(e) {
-    document.getElementById('watchlist-container').innerHTML =
-      '<div class="empty-state">Error loading watchlist</div>';
-  }
+    const port = await fetchJSON('/api/portfolio/raw');
+    document.getElementById('position-count').textContent = port.positions.length;
+    if (port.total_value > 0) {
+      document.getElementById('total-value').textContent = formatCurrency(port.total_value);
+    }
+  } catch(e) {}
 
-  // Recent trades
+  // Trades are instant DB reads
   try {
     const trades = await fetchJSON('/api/trades');
     renderTrades(trades);
   } catch(e) {}
 
-  // Sector mini-heatmap
-  try {
-    const sectors = await fetchJSON('/api/sectors');
-    renderSectorMini(sectors.sectors);
-  } catch(e) {}
+  // ── Phase 2: live prices (slower, updates after page is already showing) ───
 
-  // News feed (top 5 for watchlist)
-  try {
-    const newsFeed = await fetchJSON('/api/news?limit=5');
-    renderNewsMini(newsFeed);
-  } catch(e) {}
+  Promise.allSettled([
+    fetchJSON('/api/watchlist'),
+    fetchJSON('/api/portfolio'),
+    fetchJSON('/api/sectors'),
+    fetchJSON('/api/news?limit=5'),
+  ]).then(([wlRes, portRes, sectRes, newsRes]) => {
+    // Live watchlist prices
+    if (wlRes.status === 'fulfilled') {
+      renderWatchlist(wlRes.value);
+      renderMovers(wlRes.value);
+    }
+    // Live portfolio P&L
+    if (portRes.status === 'fulfilled') {
+      const port = portRes.value;
+      document.getElementById('total-value').textContent =
+        port.total_value > 0 ? formatCurrency(port.total_value) : '$0.00';
+      document.getElementById('total-pnl').innerHTML =
+        port.total_value > 0 ? coloredChange(port.total_pnl, true) : '$0.00';
+      document.getElementById('total-return').innerHTML =
+        port.total_value > 0 ? coloredChangePct(port.total_pnl_pct) : '0.00%';
+      document.getElementById('position-count').textContent = port.positions.length;
+    }
+    // Sector heatmap
+    if (sectRes.status === 'fulfilled') renderSectorMini(sectRes.value.sectors);
+    // News
+    if (newsRes.status === 'fulfilled') renderNewsMini(newsRes.value);
+  });
 }
 
 function renderSectorMini(sectors) {
@@ -213,13 +231,13 @@ function renderWatchlist(quotes) {
   const rows = quotes.map(q => `
     <tr class="${q.error ? 'row-error' : ''}">
       <td><a href="/stock/${q.ticker}" class="ticker-link">${q.ticker}</a></td>
-      <td class="dim">${truncate(q.name, 26)}</td>
-      <td class="num">${q.error ? '—' : formatCurrency(q.price)}</td>
-      <td class="num">${q.error ? '—' : coloredChangePct(q.change_pct)}</td>
-      <td class="num">${q.error ? '—' : coloredChangePct(q.change_1w)}</td>
+      <td class="dim">${truncate(q.name || q.ticker, 26)}</td>
+      <td class="num">${q.price == null ? '<span class="dim small">loading…</span>' : (q.price > 0 ? formatCurrency(q.price) : '—')}</td>
+      <td class="num">${q.price == null ? '—' : coloredChangePct(q.change_pct)}</td>
+      <td class="num">${q.price == null ? '—' : coloredChangePct(q.change_1w)}</td>
       <td class="num dim">${q.volume ? formatVolume(q.volume) : '—'}</td>
       <td class="num dim">${q.pe_ratio ? q.pe_ratio + 'x' : '—'}</td>
-      <td><span class="badge badge-${q.asset_type}">${q.asset_type}</span></td>
+      <td><span class="badge badge-${q.asset_type || 'stock'}">${q.asset_type || 'stock'}</span></td>
       <td>
         <button class="remove-btn" onclick="removeTicker('${q.ticker}')" title="Remove">✕</button>
       </td>

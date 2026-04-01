@@ -106,16 +106,72 @@ async def analytics_page(request: Request):
 # JSON API routes (called by the frontend JavaScript)
 # ──────────────────────────────────────────────────────────────────────────────
 
+@app.get("/api/watchlist/tickers")
+async def api_watchlist_tickers():
+    """Return watchlist tickers instantly from DB — no price fetching."""
+    entries = get_watchlist()
+    return [{"ticker": e["ticker"], "asset_type": e["asset_type"]} for e in entries]
+
+
 @app.get("/api/watchlist")
 async def api_watchlist():
-    """Return current watchlist with live quotes."""
-    quotes = get_watchlist_quotes()
-    return [_quote_to_dict(q) for q in quotes]
+    """Return current watchlist with live quotes.
+    Always returns all tickers; uses price=0 + error field if fetch fails."""
+    entries = get_watchlist()
+    if not entries:
+        return []
+    try:
+        quotes = get_watchlist_quotes()
+        fetched = {q.ticker: q for q in quotes}
+    except Exception:
+        fetched = {}
+
+    # Always return every ticker, even if price failed
+    result = []
+    for e in entries:
+        t = e["ticker"]
+        if t in fetched:
+            result.append(_quote_to_dict(fetched[t]))
+        else:
+            result.append({
+                "ticker": t, "asset_type": e["asset_type"],
+                "name": t, "price": 0, "change": 0, "change_pct": 0,
+                "error": "Price unavailable",
+            })
+    return result
+
+
+@app.get("/api/portfolio/raw")
+async def api_portfolio_raw():
+    """Return positions from DB instantly — no price fetching, uses avg_cost as price."""
+    from nantucket.portfolio import get_positions_raw
+    positions = get_positions_raw()
+    return {
+        "positions": [
+            {
+                "ticker": p["ticker"],
+                "asset_type": p["asset_type"],
+                "quantity": p["net_quantity"],
+                "avg_cost": p["avg_cost"] or 0,
+                "current_price": p["avg_cost"] or 0,
+                "current_value": (p["net_quantity"] * (p["avg_cost"] or 0)),
+                "cost_basis_total": (p["net_quantity"] * (p["avg_cost"] or 0)),
+                "unrealized_pnl": 0,
+                "unrealized_pnl_pct": 0,
+                "allocation_pct": 0,
+            }
+            for p in positions
+        ],
+        "total_value": sum(p["net_quantity"] * (p["avg_cost"] or 0) for p in positions),
+        "total_cost": sum(p["net_quantity"] * (p["avg_cost"] or 0) for p in positions),
+        "total_pnl": 0,
+        "total_pnl_pct": 0,
+    }
 
 
 @app.get("/api/portfolio")
 async def api_portfolio():
-    """Return portfolio positions with P&L."""
+    """Return portfolio positions with live P&L."""
     summary = get_portfolio_summary()
     return {
         "total_value": summary.total_value,
