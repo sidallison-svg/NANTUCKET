@@ -20,6 +20,9 @@ from __future__ import annotations
 import webbrowser
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()  # loads .env from the current directory or any parent directory
+
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
