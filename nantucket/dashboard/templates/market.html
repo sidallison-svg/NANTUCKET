@@ -1,0 +1,400 @@
+{% extends "base.html" %}
+{% block title %}Market — NANTUCKET{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <div class="page-title">Market Pulse</div>
+    <div class="page-subtitle" id="market-date">Loading...</div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <span class="dim small" id="last-updated"></span>
+    <button class="btn-ghost" onclick="refreshMarketData()" style="padding:5px 12px;font-size:12px;">Refresh</button>
+  </div>
+</div>
+
+<!-- ── Indices ──────────────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Major Indices</div>
+  <div id="indices-grid" class="stats-row" style="grid-template-columns:repeat(4,1fr);">
+    <div class="stat-card"><div class="loading-state" style="padding:12px;">Loading...</div></div>
+    <div class="stat-card"><div class="loading-state" style="padding:12px;">Loading...</div></div>
+    <div class="stat-card"><div class="loading-state" style="padding:12px;">Loading...</div></div>
+    <div class="stat-card"><div class="loading-state" style="padding:12px;">Loading...</div></div>
+  </div>
+</div>
+
+<!-- ── Sector Heatmap ───────────────────────────────────── -->
+<div class="section">
+  <div class="section-title">Sector Performance — Today</div>
+  <div id="sector-grid" class="movers-grid"></div>
+</div>
+
+<!-- ── VIX ─────────────────────────────────────────────── -->
+<div class="section">
+  <div style="display:flex;gap:16px;align-items:stretch;">
+    <div id="vix-card" class="stat-card" style="min-width:200px;">
+      <div class="stat-label">VIX — Fear &amp; Greed Gauge</div>
+      <div class="stat-value" id="vix-value">—</div>
+      <div class="small dim" id="vix-label" style="margin-top:4px;"></div>
+    </div>
+    <div class="stat-card" style="flex:1;">
+      <div class="stat-label" style="margin-bottom:6px;">What is the VIX?</div>
+      <div class="small" style="color:var(--text);line-height:1.6;">
+        The VIX measures how much volatility options traders expect over the next 30 days.
+        <strong style="color:var(--green);">Below 20</strong> = calm markets, investors are relaxed.
+        <strong style="color:var(--yellow);">20–30</strong> = elevated anxiety.
+        <strong style="color:var(--red);">Above 30</strong> = investors are scared — often signals a buying opportunity for long-term investors.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── AI Market Story ─────────────────────────────────── -->
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">Today's Market Story</div>
+    <span class="small dim">AI-generated · updates hourly</span>
+  </div>
+  <div id="story-container" class="ai-result">
+    <div class="loading-state" id="story-loading">
+      Generating market analysis... <span class="dim">(this takes ~10 seconds)</span>
+    </div>
+    <div id="story-content" style="display:none;">
+      <div id="story-text" class="ai-text" style="margin-bottom:20px;"></div>
+      <div id="sectors-watch" style="margin-bottom:20px;"></div>
+    </div>
+    <div id="story-error" style="display:none;" class="error-state"></div>
+  </div>
+</div>
+
+<!-- ── Economic Indicators ─────────────────────────────── -->
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">Economic Indicators</div>
+    <span class="small dim" id="fred-note"></span>
+  </div>
+  <div id="indicators-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;"></div>
+</div>
+
+<!-- ── Crisis & Event Monitor ─────────────────────────── -->
+<div class="section">
+  <div class="section-title">Crisis &amp; Event Monitor</div>
+  <div id="events-container">
+    <div class="loading-state" id="events-loading">Waiting for AI analysis...</div>
+    <div id="events-grid" style="display:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;"></div>
+    <div id="events-error" style="display:none;" class="error-state"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Session cache for AI story ──────────────────────────
+const STORY_CACHE_KEY = 'nantucket_market_story';
+const STORY_CACHE_TS  = 'nantucket_market_story_ts';
+const STORY_TTL_MS    = 60 * 60 * 1000; // 1 hour
+
+let autoRefreshTimer = null;
+
+// ── Helpers ─────────────────────────────────────────────
+function pct(val, decimals = 2) {
+  if (val == null) return '—';
+  const sign = val >= 0 ? '+' : '';
+  return `${sign}${val.toFixed(decimals)}%`;
+}
+
+function pctColor(val) {
+  if (val == null) return 'var(--muted)';
+  return val >= 0 ? 'var(--green)' : 'var(--red)';
+}
+
+function formatPrice(val) {
+  if (val == null) return '—';
+  if (val >= 1000) return val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return val.toFixed(2);
+}
+
+// Sector color: deep red → grey → deep green
+function sectorColor(val) {
+  if (val == null) return 'var(--bg-card)';
+  const clamped = Math.max(-3, Math.min(3, val));
+  if (clamped >= 0) {
+    const intensity = clamped / 3;
+    const g = Math.round(34 + intensity * (197 - 34));
+    return `rgba(0,${g},0,${0.15 + intensity * 0.5})`;
+  } else {
+    const intensity = Math.abs(clamped) / 3;
+    const r = Math.round(100 + intensity * 139);
+    return `rgba(${r},0,0,${0.15 + intensity * 0.5})`;
+  }
+}
+
+function sectorBorder(val) {
+  if (val == null) return 'var(--border)';
+  return val >= 0 ? `rgba(34,197,94,${Math.min(0.8, 0.2 + Math.abs(val) / 3 * 0.6)})`
+                  : `rgba(239,68,68,${Math.min(0.8, 0.2 + Math.abs(val) / 3 * 0.6)})`;
+}
+
+// ── Render indices ───────────────────────────────────────
+function renderIndices(pulse) {
+  const grid = document.getElementById('indices-grid');
+  if (!pulse || Object.keys(pulse).length === 0) {
+    grid.innerHTML = '<div class="error-state" style="grid-column:span 4;">Could not load index data.</div>';
+    return;
+  }
+  grid.innerHTML = Object.entries(pulse).map(([name, d]) => `
+    <div class="stat-card" style="border-top:3px solid ${pctColor(d.change_pct)};">
+      <div class="stat-label">${name}</div>
+      <div class="stat-value">${formatPrice(d.price)}</div>
+      <div style="font-size:14px;font-weight:600;margin-top:4px;color:${pctColor(d.change_pct)};">
+        ${pct(d.change_pct)}
+      </div>
+      <div class="small dim" style="margin-top:2px;">${d.symbol}</div>
+    </div>
+  `).join('');
+}
+
+// ── Render sector heatmap ────────────────────────────────
+function renderSectors(sectors) {
+  const grid = document.getElementById('sector-grid');
+  if (!sectors || Object.keys(sectors).length === 0) {
+    grid.innerHTML = '<div class="dim small">No sector data available.</div>';
+    return;
+  }
+  const sorted = Object.entries(sectors).sort((a, b) => b[1] - a[1]);
+  grid.innerHTML = sorted.map(([name, val]) => `
+    <div class="mover-card ${val >= 0 ? 'up' : 'down'}" style="background:${sectorColor(val)};border-color:${sectorBorder(val)};text-align:center;">
+      <div class="small dim" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">${name}</div>
+      <div style="font-size:16px;font-weight:700;margin:4px 0;color:${pctColor(val)};">${pct(val)}</div>
+    </div>
+  `).join('');
+}
+
+// ── Render VIX ───────────────────────────────────────────
+function renderVix(vix) {
+  const valEl   = document.getElementById('vix-value');
+  const labelEl = document.getElementById('vix-label');
+  const card    = document.getElementById('vix-card');
+
+  if (!vix || vix.value == null) {
+    valEl.textContent   = '—';
+    labelEl.textContent = 'Data unavailable';
+    return;
+  }
+
+  valEl.textContent   = vix.value.toFixed(2);
+  labelEl.textContent = vix.label;
+
+  let color = 'var(--green)';
+  if (vix.value >= 30)      color = 'var(--red)';
+  else if (vix.value >= 20) color = 'var(--yellow)';
+  card.style.borderTop = `3px solid ${color}`;
+  valEl.style.color    = color;
+}
+
+// ── Render economic indicators ───────────────────────────
+function renderIndicators(indicators) {
+  const grid    = document.getElementById('indicators-grid');
+  const noteEl  = document.getElementById('fred-note');
+  const hasData = indicators.some(i => i.value != null);
+
+  if (!hasData) {
+    noteEl.textContent = 'Add FRED_API_KEY env var for live values';
+  }
+
+  grid.innerHTML = indicators.map((ind, idx) => {
+    const valueStr = ind.value != null
+      ? `${ind.value}${ind.unit}`
+      : '—';
+    const trendColor = ind.trend === '▲' ? 'var(--red)' : ind.trend === '▼' ? 'var(--green)' : 'var(--muted)';
+    const dateStr = ind.date ? `<span class="dim small">${ind.date}</span>` : '';
+
+    return `
+      <div class="stat-card" style="cursor:pointer;" onclick="toggleIndicator(${idx})">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div>
+            <div class="stat-label">${ind.name}</div>
+            <div style="display:flex;align-items:baseline;gap:8px;margin-top:4px;">
+              <span class="stat-value" style="font-size:22px;">${valueStr}</span>
+              <span style="font-size:16px;color:${trendColor};">${ind.trend !== '?' ? ind.trend : ''}</span>
+            </div>
+            ${dateStr}
+          </div>
+          <span class="dim" style="font-size:18px;margin-top:4px;" id="ind-arrow-${idx}">▸</span>
+        </div>
+        <div id="ind-detail-${idx}" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+          <div style="margin-bottom:8px;">
+            <div class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">What it measures</div>
+            <div class="small" style="color:var(--text);line-height:1.6;">${ind.what}</div>
+          </div>
+          <div style="margin-bottom:8px;">
+            <div class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Why it matters for stocks</div>
+            <div class="small" style="color:var(--text);line-height:1.6;">${ind.why}</div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:6px;">
+            <div style="flex:1;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:6px;padding:8px;">
+              <div class="small" style="color:var(--green);font-weight:600;margin-bottom:2px;">Bullish when</div>
+              <div class="small" style="color:var(--text);">${ind.bullish}</div>
+            </div>
+            <div style="flex:1;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:6px;padding:8px;">
+              <div class="small" style="color:var(--red);font-weight:600;margin-bottom:2px;">Bearish when</div>
+              <div class="small" style="color:var(--text);">${ind.bearish}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleIndicator(idx) {
+  const detail = document.getElementById(`ind-detail-${idx}`);
+  const arrow  = document.getElementById(`ind-arrow-${idx}`);
+  const open   = detail.style.display !== 'none';
+  detail.style.display = open ? 'none' : 'block';
+  arrow.textContent    = open ? '▸' : '▾';
+}
+
+// ── Render AI story ──────────────────────────────────────
+function renderStory(data) {
+  document.getElementById('story-loading').style.display = 'none';
+  document.getElementById('story-content').style.display = 'block';
+
+  // Main narrative
+  const storyEl = document.getElementById('story-text');
+  storyEl.innerHTML = data.market_story
+    ? data.market_story.split('\n').filter(l => l.trim()).map(p => `<p style="margin-bottom:12px;">${p}</p>`).join('')
+    : '';
+
+  // Sectors to watch
+  const watchEl = document.getElementById('sectors-watch');
+  if (data.sectors_to_watch && data.sectors_to_watch.length) {
+    watchEl.innerHTML = `
+      <div class="section-title" style="font-size:13px;margin-bottom:8px;">Sectors to Watch</div>
+      <ul style="list-style:none;padding:0;margin:0;">
+        ${data.sectors_to_watch.map(s => `<li style="padding:4px 0;border-bottom:1px solid rgba(51,65,85,0.3);color:var(--text);">• ${s}</li>`).join('')}
+      </ul>
+    `;
+  }
+}
+
+// ── Render events ────────────────────────────────────────
+function renderEvents(events) {
+  document.getElementById('events-loading').style.display = 'none';
+  const grid = document.getElementById('events-grid');
+  grid.style.display = 'grid';
+
+  if (!events || events.length === 0) {
+    grid.innerHTML = '<div class="dim small">No major events identified.</div>';
+    return;
+  }
+
+  const severityMap = {
+    red:    { icon: '🔴', border: 'rgba(239,68,68,0.4)',  bg: 'rgba(239,68,68,0.06)' },
+    yellow: { icon: '🟡', border: 'rgba(245,158,11,0.4)', bg: 'rgba(245,158,11,0.06)' },
+    green:  { icon: '🟢', border: 'rgba(34,197,94,0.4)',  bg: 'rgba(34,197,94,0.06)'  },
+  };
+
+  grid.innerHTML = events.map(ev => {
+    const s = severityMap[ev.severity] || severityMap.yellow;
+    const helps = ev.helps && ev.helps.length ? `<span style="color:var(--green);">Helps: ${ev.helps.join(', ')}</span>` : '';
+    const hurts = ev.hurts && ev.hurts.length ? `<span style="color:var(--red);">Hurts: ${ev.hurts.join(', ')}</span>` : '';
+    return `
+      <div class="stat-card" style="border-left:3px solid ${s.border};background:${s.bg};">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <span style="font-size:16px;">${s.icon}</span>
+          <strong style="font-size:14px;">${ev.title}</strong>
+        </div>
+        <div class="small" style="color:var(--text);line-height:1.6;margin-bottom:10px;">${ev.description}</div>
+        ${helps || hurts ? `<div class="small" style="display:flex;flex-wrap:wrap;gap:8px;">${helps}${hurts}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+// ── Load market data (price / sectors / VIX / indicators) ──
+async function loadMarketData() {
+  try {
+    const data = await fetchJSON('/api/market-data');
+    document.getElementById('market-date').textContent = data.date || '';
+    document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    renderIndices(data.pulse);
+    renderSectors(data.sectors);
+    renderVix(data.vix);
+    renderIndicators(data.indicators || []);
+  } catch (err) {
+    document.getElementById('indices-grid').innerHTML =
+      `<div class="error-state" style="grid-column:span 4;">Failed to load market data: ${err.message}</div>`;
+  }
+}
+
+// ── Load AI story (cached for 1 hour) ─────────────────────
+async function loadMarketStory() {
+  // Check session cache
+  const cached = sessionStorage.getItem(STORY_CACHE_KEY);
+  const cachedTs = parseInt(sessionStorage.getItem(STORY_CACHE_TS) || '0');
+  if (cached && (Date.now() - cachedTs) < STORY_TTL_MS) {
+    try {
+      renderStory(JSON.parse(cached));
+      renderEvents(JSON.parse(cached).events);
+      return;
+    } catch (_) {}
+  }
+
+  try {
+    const data = await fetchJSON('/api/market-story');
+    sessionStorage.setItem(STORY_CACHE_KEY, JSON.stringify(data));
+    sessionStorage.setItem(STORY_CACHE_TS, Date.now().toString());
+    renderStory(data);
+    renderEvents(data.events);
+  } catch (err) {
+    document.getElementById('story-loading').style.display = 'none';
+    const errEl = document.getElementById('story-error');
+    errEl.style.display = 'block';
+    errEl.textContent = `AI analysis unavailable: ${err.message}. Ensure ANTHROPIC_API_KEY is set.`;
+    document.getElementById('events-loading').style.display = 'none';
+    const evErr = document.getElementById('events-error');
+    evErr.style.display = 'block';
+    evErr.textContent = 'Events unavailable — see AI analysis error above.';
+  }
+}
+
+// ── Manual refresh ────────────────────────────────────────
+function refreshMarketData() {
+  // Clear story cache so it regenerates
+  sessionStorage.removeItem(STORY_CACHE_KEY);
+  sessionStorage.removeItem(STORY_CACHE_TS);
+  document.getElementById('story-loading').style.display = 'block';
+  document.getElementById('story-content').style.display = 'none';
+  document.getElementById('story-error').style.display = 'none';
+  document.getElementById('events-loading').style.display = 'block';
+  document.getElementById('events-grid').style.display = 'none';
+  document.getElementById('events-error').style.display = 'none';
+  loadMarketData();
+  loadMarketStory();
+}
+
+// ── Auto-refresh during market hours (9:30 AM–4 PM ET) ───
+function scheduleAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(() => {
+    const now = new Date();
+    // ET offset: UTC-4 (EDT) or UTC-5 (EST) — approximate with UTC-4
+    const etHour = (now.getUTCHours() - 4 + 24) % 24;
+    const etMin  = now.getUTCMinutes();
+    const minuteOfDay = etHour * 60 + etMin;
+    const marketOpen  = 9 * 60 + 30;   // 9:30 AM
+    const marketClose = 16 * 60;         // 4:00 PM
+    if (minuteOfDay >= marketOpen && minuteOfDay < marketClose) {
+      loadMarketData();
+    }
+  }, 5 * 60 * 1000); // every 5 minutes
+}
+
+// ── Init ──────────────────────────────────────────────────
+loadMarketData();
+loadMarketStory();
+scheduleAutoRefresh();
+</script>
+{% endblock %}

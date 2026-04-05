@@ -14,6 +14,7 @@ URL: http://localhost:8000
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,10 @@ from nantucket.watchlist import get_watchlist_quotes, get_watchlist, add_ticker,
 from nantucket.portfolio import get_portfolio_summary, get_trade_history, record_buy, record_sell
 from nantucket.screener import run_screen, ScreenFilters, load_presets
 from nantucket.data.stocks import get_quote, get_history
+from nantucket.market import (
+    get_market_pulse, get_sector_performance,
+    get_vix, get_indicators, generate_market_story,
+)
 
 app = FastAPI(title="NANTUCKET", description="Personal Investment Dashboard")
 
@@ -73,6 +78,12 @@ async def stock_detail(request: Request, ticker: str):
     return templates.TemplateResponse(
         request, "stock.html", {"ticker": ticker.upper()},
     )
+
+
+@app.get("/market", response_class=HTMLResponse)
+async def market_page(request: Request):
+    """Daily market intelligence page."""
+    return templates.TemplateResponse(request, "market.html", {})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,6 +311,38 @@ async def api_trades():
              "quantity": t.quantity, "price": t.price,
              "total": t.quantity * t.price, "timestamp": t.timestamp,
              "asset_type": t.asset_type} for t in trades]
+
+
+@app.get("/api/market-data")
+async def api_market_data():
+    """Market pulse, sector performance, VIX, and economic indicators."""
+    pulse = get_market_pulse()
+    sectors = get_sector_performance()
+    vix = get_vix()
+    indicators = get_indicators()
+    return {
+        "date": datetime.now().strftime("%B %d, %Y"),
+        "pulse": pulse,
+        "sectors": sectors,
+        "vix": vix,
+        "indicators": indicators,
+    }
+
+
+@app.get("/api/market-story")
+async def api_market_story():
+    """AI-generated market narrative. Requires ANTHROPIC_API_KEY."""
+    try:
+        pulse = get_market_pulse()
+        sectors = get_sector_performance()
+        vix = get_vix()
+        indicators = get_indicators()
+        story = generate_market_story(pulse, sectors, vix, indicators)
+        return story
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/presets")

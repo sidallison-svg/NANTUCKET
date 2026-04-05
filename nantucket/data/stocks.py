@@ -455,6 +455,133 @@ def _filter_by_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
 # Screener universe
 # ──────────────────────────────────────────────────────────────────────────────
 
+def get_quotes_batch_yf(
+    tickers: list[str],
+    progress_callback=None,
+) -> dict[str, StockQuote]:
+    """
+    Fetch quotes for many tickers using yfinance (free, no API key needed).
+
+    Used by the screener for bulk data fetching. Batch-downloads price history
+    in one request, then fetches fundamentals individually with rate limiting.
+    """
+    import yfinance as yf
+
+    results: dict[str, StockQuote] = {}
+    done = 0
+
+    # Batch download 3 months of price data in a single request
+    price_data = None
+    try:
+        price_data = yf.download(
+            tickers, period="3mo", group_by="ticker",
+            progress=False, auto_adjust=True, threads=True,
+        )
+    except Exception:
+        pass
+
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
+
+            price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("navPrice")
+                or 0
+            )
+
+            if not price:
+                results[ticker] = StockQuote(ticker=ticker, error="No price data available")
+                done += 1
+                if progress_callback:
+                    progress_callback(done, len(tickers))
+                time.sleep(0.1)
+                continue
+
+            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose") or price
+            change = float(price) - float(prev_close)
+            change_pct = (change / float(prev_close) * 100) if prev_close else 0.0
+
+            volume = int(info.get("regularMarketVolume") or info.get("volume") or 0)
+            avg_volume = int(info.get("averageVolume") or info.get("averageDailyVolume10Day") or 0)
+            volume_ratio = (volume / avg_volume) if avg_volume > 0 else 0.0
+
+            market_cap = float(info.get("marketCap") or 0)
+            pe_ratio = info.get("trailingPE")
+            pb_ratio = info.get("priceToBook")
+            eps = info.get("trailingEps")
+            div_yield_raw = info.get("dividendYield") or 0
+            div_yield = (float(div_yield_raw) * 100) if div_yield_raw else None
+
+            sector = info.get("sector") or ""
+            industry = info.get("industry") or ""
+
+            week_52_high = float(info.get("fiftyTwoWeekHigh") or 0)
+            week_52_low = float(info.get("fiftyTwoWeekLow") or 0)
+            vs_low = ((float(price) - week_52_low) / week_52_low * 100) if week_52_low > 0 else 0.0
+
+            ma_50 = info.get("fiftyDayAverage")
+            ma_200 = info.get("twoHundredDayAverage")
+
+            rev_growth = info.get("revenueGrowth")
+            earn_growth = info.get("earningsGrowth")
+
+            # 1-week change from batch price data
+            change_1w = 0.0
+            if price_data is not None:
+                try:
+                    ticker_closes = price_data[ticker]["Close"].dropna()
+                    if len(ticker_closes) >= 6:
+                        p_start = float(ticker_closes.iloc[-6])
+                        p_end = float(ticker_closes.iloc[-1])
+                        if p_start:
+                            change_1w = (p_end - p_start) / p_start * 100
+                except Exception:
+                    pass
+
+            results[ticker] = StockQuote(
+                ticker=ticker,
+                name=info.get("shortName") or info.get("longName") or ticker,
+                price=float(price),
+                change=change,
+                change_pct=change_pct,
+                volume=volume,
+                avg_volume=avg_volume,
+                volume_ratio=volume_ratio,
+                market_cap=market_cap,
+                pe_ratio=float(pe_ratio) if pe_ratio is not None else None,
+                pb_ratio=float(pb_ratio) if pb_ratio is not None else None,
+                eps=float(eps) if eps is not None else None,
+                dividend_yield=float(div_yield) if div_yield and div_yield > 0 else None,
+                sector=sector,
+                industry=industry,
+                week_52_high=week_52_high,
+                week_52_low=week_52_low,
+                price_vs_52w_low_pct=vs_low,
+                ma_50=float(ma_50) if ma_50 is not None else None,
+                ma_200=float(ma_200) if ma_200 is not None else None,
+                above_50ma=(float(price) > float(ma_50)) if ma_50 else False,
+                above_200ma=(float(price) > float(ma_200)) if ma_200 else False,
+                change_1w=change_1w,
+                revenue_growth=float(rev_growth) if rev_growth is not None else None,
+                earnings_growth=float(earn_growth) if earn_growth is not None else None,
+                asset_type="stock",
+            )
+
+            time.sleep(0.15)  # Respect Yahoo Finance rate limits
+
+        except Exception as e:
+            results[ticker] = StockQuote(ticker=ticker, error=f"{type(e).__name__}: {e}")
+
+        done += 1
+        if progress_callback:
+            progress_callback(done, len(tickers))
+
+    return results
+
+
 def get_sp500_tickers() -> list[str]:
     """
     Fetch S&P 500 tickers from Wikipedia.
