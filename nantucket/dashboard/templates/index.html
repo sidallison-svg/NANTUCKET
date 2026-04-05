@@ -247,7 +247,7 @@ async function logTrade(action) {
   showTradeMsg(`Logging ${action.toUpperCase()} ${qty} × ${ticker}...`, 'info');
 
   try {
-    const body = {ticker, quantity: qty, asset_type: 'stock'};
+    const body = {ticker, quantity: qty};
     if (price) body.price = parseFloat(price);
 
     const res = await fetch(`/api/trade/${action}`, {

@@ -254,18 +254,42 @@ class TradeBody(BaseModel):
     asset_type: str = "stock"
 
 
+def _detect_asset_type(ticker: str, hint: str = "stock") -> str:
+    """Auto-detect asset type from ticker, falling back to hint."""
+    if hint != "stock":
+        return hint
+    from nantucket.data.crypto import TICKER_TO_ID
+    from nantucket.data.futures import FUTURES_UNIVERSE, ALIASES
+    if ticker in TICKER_TO_ID:
+        return "crypto"
+    if ticker in FUTURES_UNIVERSE or ticker in ALIASES:
+        return "future"
+    return "stock"
+
+
+def _fetch_price_for_trade(ticker: str, asset_type: str) -> float:
+    """Fetch current market price, using the right data source for the asset type."""
+    if asset_type == "crypto":
+        from nantucket.data.crypto import get_crypto_quote
+        cq = get_crypto_quote(ticker)
+        if cq.error or cq.price == 0:
+            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
+        return cq.price
+    else:
+        q = get_quote(ticker)
+        if q.error or q.price == 0:
+            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
+        return q.price
+
+
 @app.post("/api/trade/buy")
 async def api_trade_buy(body: TradeBody):
     """Log a paper buy trade."""
     ticker = body.ticker.upper().strip()
-    price = body.price
-    if price is None:
-        q = get_quote(ticker)
-        if q.error or q.price == 0:
-            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
-        price = q.price
+    asset_type = _detect_asset_type(ticker, body.asset_type)
+    price = body.price if body.price else _fetch_price_for_trade(ticker, asset_type)
     try:
-        trade_id = record_buy(ticker, body.quantity, price, body.asset_type)
+        trade_id = record_buy(ticker, body.quantity, price, asset_type)
         return {"success": True, "trade_id": trade_id, "ticker": ticker,
                 "action": "buy", "quantity": body.quantity, "price": price,
                 "total": body.quantity * price}
@@ -277,14 +301,10 @@ async def api_trade_buy(body: TradeBody):
 async def api_trade_sell(body: TradeBody):
     """Log a paper sell trade."""
     ticker = body.ticker.upper().strip()
-    price = body.price
-    if price is None:
-        q = get_quote(ticker)
-        if q.error or q.price == 0:
-            raise HTTPException(status_code=400, detail=f"Could not fetch price for {ticker}")
-        price = q.price
+    asset_type = _detect_asset_type(ticker, body.asset_type)
+    price = body.price if body.price else _fetch_price_for_trade(ticker, asset_type)
     try:
-        trade_id = record_sell(ticker, body.quantity, price)
+        trade_id = record_sell(ticker, body.quantity, price, asset_type)
         return {"success": True, "trade_id": trade_id, "ticker": ticker,
                 "action": "sell", "quantity": body.quantity, "price": price,
                 "total": body.quantity * price}
