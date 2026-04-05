@@ -455,6 +455,45 @@ def _filter_by_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
 # Screener universe
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _yf_float(val) -> Optional[float]:
+    """Safely convert a yfinance value to float, returning None on failure."""
+    try:
+        return float(val) if val is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch_yf_fundamentals(ticker: str) -> tuple[str, Optional[dict]]:
+    """
+    Fetch and cache fundamentals for one ticker from yfinance.
+    Cached for 24 hours since PE/sector etc. rarely change intraday.
+    """
+    import yfinance as yf
+
+    cached = _get_cached(ticker, "yf_fundamentals", OVERVIEW_CACHE_HOURS * 60)
+    if cached:
+        return ticker, cached
+
+    try:
+        info = yf.Ticker(ticker).info
+        result = {
+            "name":        info.get("shortName") or info.get("longName") or ticker,
+            "sector":      info.get("sector") or "",
+            "industry":    info.get("industry") or "",
+            "market_cap":  float(info.get("marketCap") or 0),
+            "pe_ratio":    _yf_float(info.get("trailingPE")),
+            "pb_ratio":    _yf_float(info.get("priceToBook")),
+            "eps":         _yf_float(info.get("trailingEps")),
+            "div_yield":   (float(info.get("dividendYield") or 0)) * 100,
+            "rev_growth":  _yf_float(info.get("revenueGrowth")),
+            "earn_growth": _yf_float(info.get("earningsGrowth")),
+        }
+        _set_cache(ticker, "yf_fundamentals", result)
+        return ticker, result
+    except Exception:
+        return ticker, None
+
+
 def get_quotes_batch_yf(
     tickers: list[str],
     progress_callback=None,
@@ -462,122 +501,132 @@ def get_quotes_batch_yf(
     """
     Fetch quotes for many tickers using yfinance (free, no API key needed).
 
-    Used by the screener for bulk data fetching. Batch-downloads price history
-    in one request, then fetches fundamentals individually with rate limiting.
+    Strategy:
+    1. One bulk yf.download(period="1y") call for all price/volume/MA/52wk data
+    2. Parallel ThreadPoolExecutor for fundamentals (.info) with 24h SQLite cache
+
+    First run: ~20-40 seconds. Subsequent runs within 24h: nearly instant from cache.
     """
     import yfinance as yf
 
     results: dict[str, StockQuote] = {}
-    done = 0
+    total = len(tickers)
 
-    # Batch download 3 months of price data in a single request
-    price_data = None
+    # ── Step 1: Bulk download 1 year of daily data (ONE request) ──────────────
+    # This gives us price, volume, and enough history to compute MA50/MA200/52wk
+    raw = None
     try:
-        price_data = yf.download(
-            tickers, period="3mo", group_by="ticker",
+        raw = yf.download(
+            tickers, period="1y", group_by="ticker",
             progress=False, auto_adjust=True, threads=True,
         )
     except Exception:
         pass
 
+    # Extract per-ticker price snapshots from the bulk download
+    price_snap: dict[str, dict] = {}
+    if raw is not None and not raw.empty:
+        # Handle both MultiIndex (multiple tickers) and flat (single ticker) formats
+        has_multi = isinstance(raw.columns, pd.MultiIndex)
+        for ticker in tickers:
+            try:
+                if has_multi:
+                    td = raw[ticker].dropna(subset=["Close"])
+                else:
+                    # Single-ticker download returns flat columns
+                    td = raw.dropna(subset=["Close"])
+
+                if td.empty or len(td) < 2:
+                    continue
+
+                closes  = td["Close"]
+                volumes = td["Volume"]
+
+                price    = float(closes.iloc[-1])
+                prev     = float(closes.iloc[-2])
+                ma_50    = float(closes.tail(50).mean()) if len(closes) >= 50 else None
+                ma_200   = float(closes.tail(200).mean()) if len(closes) >= 200 else None
+                wk52_hi  = float(closes.max())
+                wk52_lo  = float(closes.min())
+                vol_today = int(volumes.iloc[-1]) if not volumes.empty else 0
+                avg_vol  = int(volumes.mean()) if not volumes.empty else 0
+                chg_1w   = float(
+                    (closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6] * 100
+                ) if len(closes) >= 6 else 0.0
+
+                price_snap[ticker] = {
+                    "price":      price,
+                    "change":     price - prev,
+                    "change_pct": (price - prev) / prev * 100 if prev else 0.0,
+                    "volume":     vol_today,
+                    "avg_volume": avg_vol,
+                    "ma_50":      ma_50,
+                    "ma_200":     ma_200,
+                    "wk52_hi":    wk52_hi,
+                    "wk52_lo":    wk52_lo,
+                    "change_1w":  chg_1w,
+                }
+            except Exception:
+                pass
+
+    # ── Step 2: Parallel fundamentals fetch with SQLite caching ───────────────
+    fundamentals: dict[str, Optional[dict]] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        future_to_ticker = {pool.submit(_fetch_yf_fundamentals, t): t for t in tickers}
+        done = 0
+        for future in as_completed(future_to_ticker):
+            t, fund = future.result()
+            fundamentals[t] = fund
+            done += 1
+            if progress_callback:
+                progress_callback(done, total)
+
+    # ── Step 3: Assemble StockQuotes ──────────────────────────────────────────
     for ticker in tickers:
-        try:
-            t = yf.Ticker(ticker)
-            info = t.info
+        snap = price_snap.get(ticker)
+        fund = fundamentals.get(ticker) or {}
 
-            price = (
-                info.get("regularMarketPrice")
-                or info.get("currentPrice")
-                or info.get("navPrice")
-                or 0
-            )
+        if not snap:
+            results[ticker] = StockQuote(ticker=ticker, error="No price data from yfinance")
+            continue
 
-            if not price:
-                results[ticker] = StockQuote(ticker=ticker, error="No price data available")
-                done += 1
-                if progress_callback:
-                    progress_callback(done, len(tickers))
-                time.sleep(0.1)
-                continue
+        price    = snap["price"]
+        ma_50    = snap["ma_50"]
+        ma_200   = snap["ma_200"]
+        wk52_lo  = snap["wk52_lo"]
+        vol      = snap["volume"]
+        avg_vol  = snap["avg_volume"]
+        vs_low   = ((price - wk52_lo) / wk52_lo * 100) if wk52_lo > 0 else 0.0
+        div_yield = fund.get("div_yield")
 
-            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose") or price
-            change = float(price) - float(prev_close)
-            change_pct = (change / float(prev_close) * 100) if prev_close else 0.0
-
-            volume = int(info.get("regularMarketVolume") or info.get("volume") or 0)
-            avg_volume = int(info.get("averageVolume") or info.get("averageDailyVolume10Day") or 0)
-            volume_ratio = (volume / avg_volume) if avg_volume > 0 else 0.0
-
-            market_cap = float(info.get("marketCap") or 0)
-            pe_ratio = info.get("trailingPE")
-            pb_ratio = info.get("priceToBook")
-            eps = info.get("trailingEps")
-            div_yield_raw = info.get("dividendYield") or 0
-            div_yield = (float(div_yield_raw) * 100) if div_yield_raw else None
-
-            sector = info.get("sector") or ""
-            industry = info.get("industry") or ""
-
-            week_52_high = float(info.get("fiftyTwoWeekHigh") or 0)
-            week_52_low = float(info.get("fiftyTwoWeekLow") or 0)
-            vs_low = ((float(price) - week_52_low) / week_52_low * 100) if week_52_low > 0 else 0.0
-
-            ma_50 = info.get("fiftyDayAverage")
-            ma_200 = info.get("twoHundredDayAverage")
-
-            rev_growth = info.get("revenueGrowth")
-            earn_growth = info.get("earningsGrowth")
-
-            # 1-week change from batch price data
-            change_1w = 0.0
-            if price_data is not None:
-                try:
-                    ticker_closes = price_data[ticker]["Close"].dropna()
-                    if len(ticker_closes) >= 6:
-                        p_start = float(ticker_closes.iloc[-6])
-                        p_end = float(ticker_closes.iloc[-1])
-                        if p_start:
-                            change_1w = (p_end - p_start) / p_start * 100
-                except Exception:
-                    pass
-
-            results[ticker] = StockQuote(
-                ticker=ticker,
-                name=info.get("shortName") or info.get("longName") or ticker,
-                price=float(price),
-                change=change,
-                change_pct=change_pct,
-                volume=volume,
-                avg_volume=avg_volume,
-                volume_ratio=volume_ratio,
-                market_cap=market_cap,
-                pe_ratio=float(pe_ratio) if pe_ratio is not None else None,
-                pb_ratio=float(pb_ratio) if pb_ratio is not None else None,
-                eps=float(eps) if eps is not None else None,
-                dividend_yield=float(div_yield) if div_yield and div_yield > 0 else None,
-                sector=sector,
-                industry=industry,
-                week_52_high=week_52_high,
-                week_52_low=week_52_low,
-                price_vs_52w_low_pct=vs_low,
-                ma_50=float(ma_50) if ma_50 is not None else None,
-                ma_200=float(ma_200) if ma_200 is not None else None,
-                above_50ma=(float(price) > float(ma_50)) if ma_50 else False,
-                above_200ma=(float(price) > float(ma_200)) if ma_200 else False,
-                change_1w=change_1w,
-                revenue_growth=float(rev_growth) if rev_growth is not None else None,
-                earnings_growth=float(earn_growth) if earn_growth is not None else None,
-                asset_type="stock",
-            )
-
-            time.sleep(0.15)  # Respect Yahoo Finance rate limits
-
-        except Exception as e:
-            results[ticker] = StockQuote(ticker=ticker, error=f"{type(e).__name__}: {e}")
-
-        done += 1
-        if progress_callback:
-            progress_callback(done, len(tickers))
+        results[ticker] = StockQuote(
+            ticker=ticker,
+            name=fund.get("name") or ticker,
+            price=price,
+            change=snap["change"],
+            change_pct=snap["change_pct"],
+            volume=vol,
+            avg_volume=avg_vol,
+            volume_ratio=(vol / avg_vol) if avg_vol > 0 else 0.0,
+            market_cap=fund.get("market_cap") or 0.0,
+            pe_ratio=fund.get("pe_ratio"),
+            pb_ratio=fund.get("pb_ratio"),
+            eps=fund.get("eps"),
+            dividend_yield=float(div_yield) if div_yield and div_yield > 0 else None,
+            sector=fund.get("sector") or "",
+            industry=fund.get("industry") or "",
+            week_52_high=snap["wk52_hi"],
+            week_52_low=wk52_lo,
+            price_vs_52w_low_pct=vs_low,
+            ma_50=ma_50,
+            ma_200=ma_200,
+            above_50ma=(price > ma_50) if ma_50 else False,
+            above_200ma=(price > ma_200) if ma_200 else False,
+            change_1w=snap["change_1w"],
+            revenue_growth=fund.get("rev_growth"),
+            earnings_growth=fund.get("earn_growth"),
+            asset_type="stock",
+        )
 
     return results
 

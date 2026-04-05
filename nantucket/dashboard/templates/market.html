@@ -71,7 +71,7 @@
 <!-- ── Economic Indicators ─────────────────────────────── -->
 <div class="section">
   <div class="section-header">
-    <div class="section-title">Economic Indicators</div>
+    <div class="section-title">Economic Indicators <span class="dim small" style="font-weight:400;font-size:12px;">— click any card to collapse</span></div>
     <span class="small dim" id="fred-note"></span>
   </div>
   <div id="indicators-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;"></div>
@@ -221,9 +221,9 @@ function renderIndicators(indicators) {
             </div>
             ${dateStr}
           </div>
-          <span class="dim" style="font-size:18px;margin-top:4px;" id="ind-arrow-${idx}">▸</span>
+          <span class="dim" style="font-size:18px;margin-top:4px;" id="ind-arrow-${idx}">▾</span>
         </div>
-        <div id="ind-detail-${idx}" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+        <div id="ind-detail-${idx}" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
           <div style="margin-bottom:8px;">
             <div class="small" style="color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">What it measures</div>
             <div class="small" style="color:var(--text);line-height:1.6;">${ind.what}</div>
@@ -251,7 +251,7 @@ function renderIndicators(indicators) {
 function toggleIndicator(idx) {
   const detail = document.getElementById(`ind-detail-${idx}`);
   const arrow  = document.getElementById(`ind-arrow-${idx}`);
-  const open   = detail.style.display !== 'none';
+  const open   = detail.style.display !== 'none' && detail.style.display !== '';
   detail.style.display = open ? 'none' : 'block';
   arrow.textContent    = open ? '▸' : '▾';
 }
