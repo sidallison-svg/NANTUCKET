@@ -34,6 +34,7 @@ AV_BASE = "https://www.alphavantage.co/query"
 QUOTE_CACHE_MINUTES = 15      # How long to cache price quotes
 OVERVIEW_CACHE_HOURS = 24     # How long to cache fundamentals
 HISTORY_CACHE_HOURS = 24      # How long to cache price history
+YF_FUNDAMENTALS_CACHE_HOURS = 7 * 24   # Cache yfinance fundamentals 7 days
 
 
 def _get_api_key() -> str:
@@ -463,35 +464,59 @@ def _yf_float(val) -> Optional[float]:
         return None
 
 
-def _fetch_yf_fundamentals(ticker: str) -> tuple[str, Optional[dict]]:
+def _yf_session():
+    """Build a requests Session with browser headers to avoid Yahoo bot detection."""
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return sess
+
+
+def _fetch_yf_fundamentals(ticker: str, sess=None) -> tuple[str, Optional[dict]]:
     """
-    Fetch and cache fundamentals for one ticker from yfinance.
-    Cached for 24 hours since PE/sector etc. rarely change intraday.
+    Fetch fundamentals for one ticker via yfinance.info.
+    Cached for 7 days — PE/sector rarely change.
+    Returns (ticker, dict) or (ticker, None) on any failure.
     """
     import yfinance as yf
 
-    cached = _get_cached(ticker, "yf_fundamentals", OVERVIEW_CACHE_HOURS * 60)
+    cached = _get_cached(ticker, "yf_fundamentals", YF_FUNDAMENTALS_CACHE_HOURS * 60)
     if cached:
         return ticker, cached
 
-    try:
-        info = yf.Ticker(ticker).info
-        result = {
-            "name":        info.get("shortName") or info.get("longName") or ticker,
-            "sector":      info.get("sector") or "",
-            "industry":    info.get("industry") or "",
-            "market_cap":  float(info.get("marketCap") or 0),
-            "pe_ratio":    _yf_float(info.get("trailingPE")),
-            "pb_ratio":    _yf_float(info.get("priceToBook")),
-            "eps":         _yf_float(info.get("trailingEps")),
-            "div_yield":   (float(info.get("dividendYield") or 0)) * 100,
-            "rev_growth":  _yf_float(info.get("revenueGrowth")),
-            "earn_growth": _yf_float(info.get("earningsGrowth")),
-        }
-        _set_cache(ticker, "yf_fundamentals", result)
-        return ticker, result
-    except Exception:
-        return ticker, None
+    for attempt in range(3):
+        try:
+            info = yf.Ticker(ticker, session=sess).info
+            if not info or len(info) < 3:
+                return ticker, None
+            result = {
+                "name":        info.get("shortName") or info.get("longName") or ticker,
+                "sector":      info.get("sector") or "",
+                "industry":    info.get("industry") or "",
+                "market_cap":  float(info.get("marketCap") or 0),
+                "pe_ratio":    _yf_float(info.get("trailingPE")),
+                "pb_ratio":    _yf_float(info.get("priceToBook")),
+                "eps":         _yf_float(info.get("trailingEps")),
+                "div_yield":   (float(info.get("dividendYield") or 0)) * 100,
+                "rev_growth":  _yf_float(info.get("revenueGrowth")),
+                "earn_growth": _yf_float(info.get("earningsGrowth")),
+            }
+            _set_cache(ticker, "yf_fundamentals", result)
+            return ticker, result
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                time.sleep(2 ** (attempt + 2))  # 4s, 8s, 16s backoff
+            else:
+                break
+
+    return ticker, None
 
 
 def get_quotes_batch_yf(
@@ -502,84 +527,69 @@ def get_quotes_batch_yf(
     Fetch quotes for many tickers using yfinance (free, no API key needed).
 
     Strategy:
-    1. One bulk yf.download(period="1y") call for all price/volume/MA/52wk data
-    2. Parallel ThreadPoolExecutor for fundamentals (.info) with 24h SQLite cache
+    1. One bulk yf.download(period="1y") for all price/volume/MA/52wk data
+    2. Sequential .info calls with 1s gap + browser headers + 7-day SQLite cache
+       Sequential (not parallel) to avoid triggering Yahoo rate limits.
 
-    First run: ~20-40 seconds. Subsequent runs within 24h: nearly instant from cache.
+    First run: ~3-5 min for 100 stocks. After that, cached for 7 days.
     """
     import yfinance as yf
 
     results: dict[str, StockQuote] = {}
     total = len(tickers)
+    sess = _yf_session()
 
-    # ── Step 1: Bulk download 1 year of daily data (ONE request) ──────────────
-    # This gives us price, volume, and enough history to compute MA50/MA200/52wk
+    # ── Step 1: Bulk price/history download (one request for all tickers) ─────
     raw = None
     try:
         raw = yf.download(
             tickers, period="1y", group_by="ticker",
             progress=False, auto_adjust=True, threads=True,
+            session=sess,
         )
     except Exception:
         pass
 
-    # Extract per-ticker price snapshots from the bulk download
     price_snap: dict[str, dict] = {}
     if raw is not None and not raw.empty:
-        # Handle both MultiIndex (multiple tickers) and flat (single ticker) formats
         has_multi = isinstance(raw.columns, pd.MultiIndex)
         for ticker in tickers:
             try:
-                if has_multi:
-                    td = raw[ticker].dropna(subset=["Close"])
-                else:
-                    # Single-ticker download returns flat columns
-                    td = raw.dropna(subset=["Close"])
-
+                td = raw[ticker].dropna(subset=["Close"]) if has_multi else raw.dropna(subset=["Close"])
                 if td.empty or len(td) < 2:
                     continue
-
                 closes  = td["Close"]
                 volumes = td["Volume"]
-
-                price    = float(closes.iloc[-1])
-                prev     = float(closes.iloc[-2])
-                ma_50    = float(closes.tail(50).mean()) if len(closes) >= 50 else None
-                ma_200   = float(closes.tail(200).mean()) if len(closes) >= 200 else None
-                wk52_hi  = float(closes.max())
-                wk52_lo  = float(closes.min())
-                vol_today = int(volumes.iloc[-1]) if not volumes.empty else 0
-                avg_vol  = int(volumes.mean()) if not volumes.empty else 0
-                chg_1w   = float(
-                    (closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6] * 100
-                ) if len(closes) >= 6 else 0.0
-
+                price   = float(closes.iloc[-1])
+                prev    = float(closes.iloc[-2])
                 price_snap[ticker] = {
                     "price":      price,
                     "change":     price - prev,
                     "change_pct": (price - prev) / prev * 100 if prev else 0.0,
-                    "volume":     vol_today,
-                    "avg_volume": avg_vol,
-                    "ma_50":      ma_50,
-                    "ma_200":     ma_200,
-                    "wk52_hi":    wk52_hi,
-                    "wk52_lo":    wk52_lo,
-                    "change_1w":  chg_1w,
+                    "volume":     int(volumes.iloc[-1]) if not volumes.empty else 0,
+                    "avg_volume": int(volumes.mean()) if not volumes.empty else 0,
+                    "ma_50":      float(closes.tail(50).mean()) if len(closes) >= 50 else None,
+                    "ma_200":     float(closes.tail(200).mean()) if len(closes) >= 200 else None,
+                    "wk52_hi":    float(closes.max()),
+                    "wk52_lo":    float(closes.min()),
+                    "change_1w":  float((closes.iloc[-1] - closes.iloc[-6]) / closes.iloc[-6] * 100) if len(closes) >= 6 else 0.0,
                 }
             except Exception:
                 pass
 
-    # ── Step 2: Parallel fundamentals fetch with SQLite caching ───────────────
+    # ── Step 2: Sequential fundamentals fetch (1s gap avoids rate limits) ─────
+    # Checks cache first — skips the sleep if already cached.
     fundamentals: dict[str, Optional[dict]] = {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        future_to_ticker = {pool.submit(_fetch_yf_fundamentals, t): t for t in tickers}
-        done = 0
-        for future in as_completed(future_to_ticker):
-            t, fund = future.result()
-            fundamentals[t] = fund
-            done += 1
-            if progress_callback:
-                progress_callback(done, total)
+    done = 0
+    for ticker in tickers:
+        already_cached = bool(_get_cached(ticker, "yf_fundamentals", YF_FUNDAMENTALS_CACHE_HOURS * 60))
+        _, fund = _fetch_yf_fundamentals(ticker, sess=sess)
+        fundamentals[ticker] = fund
+        if not already_cached:
+            time.sleep(1.0)  # Only sleep when we actually hit Yahoo
+        done += 1
+        if progress_callback:
+            progress_callback(done, total)
 
     # ── Step 3: Assemble StockQuotes ──────────────────────────────────────────
     for ticker in tickers:
@@ -590,13 +600,13 @@ def get_quotes_batch_yf(
             results[ticker] = StockQuote(ticker=ticker, error="No price data from yfinance")
             continue
 
-        price    = snap["price"]
-        ma_50    = snap["ma_50"]
-        ma_200   = snap["ma_200"]
-        wk52_lo  = snap["wk52_lo"]
-        vol      = snap["volume"]
-        avg_vol  = snap["avg_volume"]
-        vs_low   = ((price - wk52_lo) / wk52_lo * 100) if wk52_lo > 0 else 0.0
+        price   = snap["price"]
+        ma_50   = snap["ma_50"]
+        ma_200  = snap["ma_200"]
+        wk52_lo = snap["wk52_lo"]
+        vol     = snap["volume"]
+        avg_vol = snap["avg_volume"]
+        vs_low  = ((price - wk52_lo) / wk52_lo * 100) if wk52_lo > 0 else 0.0
         div_yield = fund.get("div_yield")
 
         results[ticker] = StockQuote(
