@@ -192,7 +192,7 @@ def _fetch_overview(ticker: str) -> Optional[dict]:
     Cached for 24 hours since fundamentals don't change often.
     Costs 1 API request.
     """
-    cached = _get_cached(ticker, "overview", OVERVIEW_CACHE_HOURS * 60)
+    cached = _get_cached(ticker, "overview", YF_FUNDAMENTALS_CACHE_HOURS * 60)
     if cached:
         return cached
 
@@ -232,7 +232,7 @@ def _fetch_overview(ticker: str) -> Optional[dict]:
             "earnings_growth": _f("QuarterlyEarningsGrowthYOY"),
             "avg_volume":      int(_f("10DayAverageTradingVolume") or 0) * 1000,
         }
-        _set_cache(ticker, "overview", result)
+        _set_cache(ticker, "overview", result)  # Cached 7 days
         return result
 
     except Exception:
@@ -577,16 +577,35 @@ def get_quotes_batch_yf(
             except Exception:
                 pass
 
-    # ── Step 2: Sequential fundamentals fetch (1s gap avoids rate limits) ─────
-    # Checks cache first — skips the sleep if already cached.
+    # ── Step 2: Fundamentals from Alpha Vantage (7-day cache) ────────────────
+    # AV OVERVIEW gives PE, PB, sector, market cap etc. At 25 req/day free
+    # tier, and with 7-day caching, a 100-stock screener fills its cache in
+    # ~4 days and then runs instantly from cache indefinitely.
+    # If no AV key is set, fund stays empty — price-based filters still work.
     fundamentals: dict[str, Optional[dict]] = {}
     done = 0
+    has_av_key = bool(os.environ.get("ALPHA_VANTAGE_KEY", ""))
     for ticker in tickers:
-        already_cached = bool(_get_cached(ticker, "yf_fundamentals", YF_FUNDAMENTALS_CACHE_HOURS * 60))
-        _, fund = _fetch_yf_fundamentals(ticker, sess=sess)
-        fundamentals[ticker] = fund
-        if not already_cached:
-            time.sleep(1.0)  # Only sleep when we actually hit Yahoo
+        if has_av_key:
+            ov = _fetch_overview(ticker)  # returns cache or fetches from AV
+            if ov:
+                # Map AV overview fields to the expected keys
+                fundamentals[ticker] = {
+                    "name":        ov.get("name") or ticker,
+                    "sector":      ov.get("sector") or "",
+                    "industry":    ov.get("industry") or "",
+                    "market_cap":  ov.get("market_cap") or 0.0,
+                    "pe_ratio":    ov.get("pe_ratio"),
+                    "pb_ratio":    ov.get("pb_ratio"),
+                    "eps":         ov.get("eps"),
+                    "div_yield":   ov.get("dividend_yield") or 0,
+                    "rev_growth":  ov.get("revenue_growth"),
+                    "earn_growth": ov.get("earnings_growth"),
+                }
+            else:
+                fundamentals[ticker] = None
+        else:
+            fundamentals[ticker] = None
         done += 1
         if progress_callback:
             progress_callback(done, total)
