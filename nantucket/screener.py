@@ -30,7 +30,7 @@ from typing import Optional
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-from nantucket.data.stocks import StockQuote, get_quotes_batch, get_quotes_batch_yf, get_sp500_tickers, TOP_100_SP500
+from nantucket.data.stocks import StockQuote, get_quotes_batch, get_sp500_tickers, TOP_100_SP500
 
 # Path to the built-in presets file
 PRESETS_PATH = Path(__file__).parent.parent / "presets" / "default_screens.json"
@@ -320,12 +320,13 @@ def run_screen(
             def on_progress(done: int, total: int) -> None:
                 progress.update(task, completed=done)
 
-            quotes_dict = get_quotes_batch_yf(
+            quotes_dict = get_quotes_batch(
                 ticker_list,
+                max_workers=3,
                 progress_callback=on_progress,
             )
     else:
-        quotes_dict = get_quotes_batch_yf(ticker_list)
+        quotes_dict = get_quotes_batch(ticker_list, max_workers=3)
 
     # Count errors
     errors = sum(1 for q in quotes_dict.values() if q.error)

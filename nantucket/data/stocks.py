@@ -31,10 +31,13 @@ import requests
 # ──────────────────────────────────────────────────────────────────────────────
 
 AV_BASE = "https://www.alphavantage.co/query"
-QUOTE_CACHE_MINUTES = 15      # How long to cache price quotes
-OVERVIEW_CACHE_HOURS = 24     # How long to cache fundamentals
-HISTORY_CACHE_HOURS = 24      # How long to cache price history
-YF_FUNDAMENTALS_CACHE_HOURS = 7 * 24   # Cache yfinance fundamentals 7 days
+QUOTE_CACHE_MINUTES = 15      # Price quotes — refresh every 15 min
+OVERVIEW_CACHE_HOURS = 24     # Kept for reference
+HISTORY_CACHE_HOURS = 24      # Price history
+YF_FUNDAMENTALS_CACHE_HOURS = 7 * 24   # yfinance fundamentals
+AV_OVERVIEW_CACHE_DAYS = 30   # Alpha Vantage fundamentals — 30 days
+                               # PE/sector don't change daily; long TTL
+                               # keeps us well within the 25 req/day limit
 
 
 def _get_api_key() -> str:
@@ -192,7 +195,7 @@ def _fetch_overview(ticker: str) -> Optional[dict]:
     Cached for 24 hours since fundamentals don't change often.
     Costs 1 API request.
     """
-    cached = _get_cached(ticker, "overview", YF_FUNDAMENTALS_CACHE_HOURS * 60)
+    cached = _get_cached(ticker, "overview", AV_OVERVIEW_CACHE_DAYS * 24 * 60)
     if cached:
         return cached
 
